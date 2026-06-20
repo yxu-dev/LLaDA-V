@@ -19,6 +19,7 @@
 # limitations under the License.
 """PyTorch LLaDA model."""
 
+import copy
 import math
 import warnings
 from typing import List, Optional, Tuple, Union
@@ -89,6 +90,125 @@ def _selected_layer_outputs(values, selected_layers, hidden_states=False):
         return values
     offset = 1 if hidden_states else 0
     return tuple(values[layer + offset] for layer in selected_layers)
+
+
+def _layout_fixed_positions(layouts, batch_size, sequence_length, device):
+    fixed = torch.zeros(
+        (batch_size, sequence_length),
+        dtype=torch.bool,
+        device=device,
+    )
+    for batch_index in range(batch_size):
+        layout = layouts[min(batch_index, len(layouts) - 1)]
+        token_types = list(layout.get("token_types", []))
+        if len(token_types) != sequence_length:
+            raise ValueError("layout token types must align with generation state")
+        fixed[batch_index] = torch.tensor(
+            [
+                token_type not in {"generated_masked", "generated_unmasked"}
+                for token_type in token_types
+            ],
+            dtype=torch.bool,
+            device=device,
+        )
+    return fixed
+
+
+def _extra_transfer_mask(
+    proposal,
+    *,
+    reference,
+    mask_index,
+    current_block,
+    prompt_index,
+    fixed_positions,
+):
+    if proposal is None:
+        return torch.zeros_like(reference, dtype=torch.bool)
+    if not isinstance(proposal, torch.Tensor):
+        raise TypeError("transfer_policy_callback must return a torch.Tensor or None")
+    if proposal.dtype != torch.bool:
+        raise TypeError("transfer_policy_callback must return a boolean tensor")
+    if proposal.shape != reference.shape:
+        raise ValueError(
+            "transfer_policy_callback mask shape must match transfer_index"
+        )
+    proposal = proposal.detach().to(device=reference.device)
+    return (
+        proposal
+        & mask_index
+        & current_block
+        & ~prompt_index
+        & ~fixed_positions
+        & ~reference
+    )
+
+
+def _visual_key_selection(proposal, *, layouts, batch_size, sequence_length, device):
+    if proposal is None:
+        return torch.zeros(
+            (batch_size, sequence_length),
+            dtype=torch.bool,
+            device=device,
+        )
+    if not isinstance(proposal, torch.Tensor):
+        raise TypeError("visual_mask_policy_callback must return a torch.Tensor or None")
+    if proposal.dtype != torch.bool:
+        raise TypeError("visual_mask_policy_callback must return a boolean tensor")
+    expected_shape = (batch_size, sequence_length)
+    if tuple(proposal.shape) != expected_shape:
+        raise ValueError(
+            "visual_mask_policy_callback mask shape must be "
+            f"{expected_shape}, got {tuple(proposal.shape)}"
+        )
+    proposal = proposal.detach().to(device=device)
+    visual = torch.zeros_like(proposal, dtype=torch.bool)
+    for batch_index in range(batch_size):
+        layout = layouts[min(batch_index, len(layouts) - 1)]
+        for start, end in layout.get("visual_spans", []):
+            visual[batch_index, start:end] = True
+    return proposal & visual
+
+
+def _dynamic_visual_attention_mask(
+    selected_visual_keys,
+    *,
+    layouts,
+    step,
+    activation_step,
+    sequence_length,
+    device,
+):
+    if (
+        selected_visual_keys is None
+        or activation_step is None
+        or step < activation_step
+        or not torch.any(selected_visual_keys)
+    ):
+        return None
+    batch_size = selected_visual_keys.shape[0]
+    attention_mask = torch.ones(
+        (batch_size, 1, sequence_length, sequence_length),
+        dtype=torch.bool,
+        device=device,
+    )
+    for batch_index in range(batch_size):
+        layout = layouts[min(batch_index, len(layouts) - 1)]
+        generated_span = layout.get("generated_span")
+        if generated_span is None:
+            raise ValueError("dynamic B4 masking requires a generated token span")
+        query_start, query_end = generated_span
+        selected = torch.nonzero(
+            selected_visual_keys[batch_index],
+            as_tuple=False,
+        ).flatten()
+        attention_mask[
+            batch_index,
+            0,
+            query_start:query_end,
+            selected,
+        ] = False
+    return attention_mask
 
 
 def _extend_multimodal_layouts(layouts, prompt_length, gen_length, suffix_length):
@@ -1427,6 +1547,10 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         profiler_options=None,
         multimodal_layout=None,
         intervention=None,
+        transfer_policy_callback=None,
+        visual_mask_policy_callback=None,
+        visual_mask_policy_step=None,
+        visual_mask_policy_layer=None,
         **kwargs,
     ):
         '''
@@ -1473,12 +1597,51 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             selected_layers = tuple(
                 _profiler_option(profiler_options, "selected_layers", ())
             )
+            if visual_mask_policy_callback is not None:
+                if intervention is not None:
+                    raise ValueError(
+                        "dynamic B4 callback and static intervention are mutually exclusive"
+                    )
+                attention_backend = getattr(
+                    self.config, "_attn_implementation", None
+                )
+                if attention_backend != "eager":
+                    raise ValueError(
+                        "dynamic B4 callback requires eager attention backend"
+                    )
+                if not isinstance(visual_mask_policy_step, int) or not (
+                    0 <= visual_mask_policy_step < steps
+                ):
+                    raise ValueError(
+                        "visual_mask_policy_step must be a valid global step"
+                    )
+                layer_count = int(
+                    getattr(
+                        self.config,
+                        "num_hidden_layers",
+                        getattr(self.config, "n_layers", 0),
+                    )
+                )
+                if not isinstance(visual_mask_policy_layer, int) or not (
+                    0 <= visual_mask_policy_layer < layer_count
+                ):
+                    raise ValueError(
+                        "visual_mask_policy_layer must identify an existing layer"
+                    )
             extended_layouts = _extend_multimodal_layouts(
                 multimodal_layout,
                 inputs_embeds.shape[1],
                 gen_length,
                 suffix_len,
             )
+            fixed_positions = None
+            if transfer_policy_callback is not None:
+                fixed_positions = _layout_fixed_positions(
+                    extended_layouts,
+                    inputs_embeds.shape[0],
+                    inputs_embeds.shape[1] + gen_length + suffix_len,
+                    inputs_embeds.device,
+                )
 
             # Create input in embedding space
             total_length = inputs_embeds.shape[1] + gen_length + suffix_len
@@ -1518,6 +1681,10 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
 
             feature_cache = dLLMCache()
             feature_cache.reset_cache(inputs_embeds.shape[1])
+            selected_visual_keys = None
+            visual_mask_activation_step = None
+            visual_mask_fallback_action = None
+            visual_mask_participation_proxy = 0.0
             for num_block in range(num_blocks):
                 # Create mask index for the current block
                 block_start = inputs_embeds.shape[1] + num_block * block_length
@@ -1531,7 +1698,6 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                 block_mask_index = torch.all(torch.abs(block_embeds - masked_embed) < 1e-5, dim=2)
                 
                 num_transfer_tokens = self.get_num_transfer_tokens(block_mask_index, steps)
-                
                 for i in range(steps):
                     global_step = num_block * steps + i
                     # Determine which positions are mask embeddings
@@ -1559,6 +1725,18 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         x_embeds.shape[1],
                         x_embeds.device,
                     )
+                    dynamic_visual_mask = None
+                    if visual_mask_policy_callback is not None:
+                        dynamic_visual_mask = _dynamic_visual_attention_mask(
+                            selected_visual_keys,
+                            layouts=extended_layouts,
+                            step=global_step,
+                            activation_step=visual_mask_activation_step,
+                            sequence_length=x_embeds.shape[1],
+                            device=x_embeds.device,
+                        )
+                    if dynamic_visual_mask is not None:
+                        intervention_mask = dynamic_visual_mask
                     model_kwargs = {}
                     if intervention_mask is not None:
                         model_kwargs["attention_mask"] = intervention_mask
@@ -1566,6 +1744,12 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         model_kwargs["output_hidden_states"] = True
                         model_kwargs["return_dict"] = True
                     if capture_attentions:
+                        model_kwargs["output_attentions"] = True
+                        model_kwargs["return_dict"] = True
+                    if (
+                        visual_mask_policy_callback is not None
+                        and global_step == visual_mask_policy_step
+                    ):
                         model_kwargs["output_attentions"] = True
                         model_kwargs["return_dict"] = True
                     if cfg_scale > 0.:
@@ -1630,14 +1814,137 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     
                     transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
                     for j in range(confidence.shape[0]):
-                        _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
+                        if transfer_policy_callback is None:
+                            _, select_index = torch.topk(
+                                confidence[j],
+                                k=num_transfer_tokens[j, i],
+                            )
+                        else:
+                            current_block_for_batch = mask_index[j].clone()
+                            current_block_for_batch[:block_start] = False
+                            current_block_for_batch[block_end:] = False
+                            transfer_count = min(
+                                int(num_transfer_tokens[j, i].item()),
+                                int(current_block_for_batch.sum().item()),
+                            )
+                            if transfer_count == 0:
+                                continue
+                            _, select_index = torch.topk(
+                                confidence[j],
+                                k=transfer_count,
+                            )
                         transfer_index[j, select_index] = True
+                    vanilla_transfer_index = transfer_index.detach().clone()
+                    extra_transfer_index = torch.zeros_like(
+                        transfer_index,
+                        dtype=torch.bool,
+                    )
+                    transfer_policy_fallback_action = None
+                    if transfer_policy_callback is not None:
+                        current_block = torch.zeros_like(
+                            mask_index,
+                            dtype=torch.bool,
+                        )
+                        current_block[:, block_start:block_end] = True
+                        proposal = transfer_policy_callback(
+                            step=global_step,
+                            block=num_block,
+                            block_step=i,
+                            input_ids=x.detach().clone(),
+                            mask_state=mask_index.detach().clone(),
+                            predictions=x0.detach().clone(),
+                            confidence=confidence.detach().clone(),
+                            vanilla_transfer_index=(
+                                vanilla_transfer_index.detach().clone()
+                            ),
+                            prompt_index=prompt_index.detach().clone(),
+                            current_block=current_block.detach().clone(),
+                            fixed_positions=fixed_positions.detach().clone(),
+                            multimodal_layout=copy.deepcopy(extended_layouts),
+                            metadata={
+                                "steps_per_block": steps,
+                                "prompt_length": inputs_embeds.shape[1],
+                                "gen_length": gen_length,
+                                "block_length": block_length,
+                                "suffix_length": suffix_len,
+                                "fallback_action": "keep_vanilla_transfer",
+                            },
+                        )
+                        extra_transfer_index = _extra_transfer_mask(
+                            proposal,
+                            reference=transfer_index,
+                            mask_index=mask_index,
+                            current_block=current_block,
+                            prompt_index=prompt_index,
+                            fixed_positions=fixed_positions,
+                        )
+                        if not torch.any(extra_transfer_index):
+                            transfer_policy_fallback_action = (
+                                "keep_vanilla_transfer"
+                            )
+                        transfer_index |= extra_transfer_index
                     
                     input_ids_before = x.detach().clone() if profiler_enabled else None
 
                     # Update embeddings and token IDs
                     x_embeds[transfer_index] = x0_embeds[transfer_index]
                     x[transfer_index] = x0[transfer_index]
+
+                    if (
+                        visual_mask_policy_callback is not None
+                        and global_step == visual_mask_policy_step
+                    ):
+                        all_attentions = getattr(outputs, "attentions", None)
+                        if all_attentions is None:
+                            raise RuntimeError(
+                                "dynamic B4 ranking attention was not returned"
+                            )
+                        ranking_attention = all_attentions[
+                            visual_mask_policy_layer
+                        ]
+                        if cfg_scale > 0.0:
+                            ranking_attention = ranking_attention[
+                                : inputs_embeds.shape[0]
+                            ]
+                        proposal = visual_mask_policy_callback(
+                            step=global_step,
+                            layer=visual_mask_policy_layer,
+                            attention=ranking_attention.detach().clone(),
+                            input_ids=x.detach().clone(),
+                            mask_state=mask_index.detach().clone(),
+                            multimodal_layout=copy.deepcopy(extended_layouts),
+                            metadata={
+                                "activation_step": global_step + 1,
+                                "fallback_action": (
+                                    "keep_full_attention_participation"
+                                ),
+                            },
+                        )
+                        selected_visual_keys = _visual_key_selection(
+                            proposal,
+                            layouts=extended_layouts,
+                            batch_size=x_embeds.shape[0],
+                            sequence_length=x_embeds.shape[1],
+                            device=x_embeds.device,
+                        )
+                        visual_mask_activation_step = global_step + 1
+                        target_count = int(selected_visual_keys.sum().item())
+                        visual_count = sum(
+                            end - start
+                            for start, end in extended_layouts[0].get(
+                                "visual_spans", []
+                            )
+                        )
+                        visual_mask_participation_proxy = (
+                            target_count / visual_count
+                            if visual_count > 0
+                            else 0.0
+                        )
+                        visual_mask_fallback_action = (
+                            None
+                            if target_count > 0
+                            else "keep_full_attention_participation"
+                        )
 
                     if profiler_enabled:
                         mask_state_after = torch.all(
@@ -1700,6 +2007,39 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                                     self.config, "_attn_implementation", None
                                 ),
                                 "intervention_applied": intervention_mask is not None,
+                                "vanilla_transfer_count": int(
+                                    vanilla_transfer_index.sum().item()
+                                ),
+                                "extra_transfer_count": int(
+                                    extra_transfer_index.sum().item()
+                                ),
+                                "transfer_policy_fallback_action": (
+                                    transfer_policy_fallback_action
+                                ),
+                                "visual_mask_ranking_step": (
+                                    visual_mask_policy_step
+                                    if visual_mask_policy_callback is not None
+                                    else None
+                                ),
+                                "visual_mask_ranking_layer": (
+                                    visual_mask_policy_layer
+                                    if visual_mask_policy_callback is not None
+                                    else None
+                                ),
+                                "visual_mask_activation_step": (
+                                    visual_mask_activation_step
+                                ),
+                                "visual_mask_target_count": (
+                                    int(selected_visual_keys.sum().item())
+                                    if selected_visual_keys is not None
+                                    else 0
+                                ),
+                                "visual_mask_participation_proxy": (
+                                    visual_mask_participation_proxy
+                                ),
+                                "visual_mask_fallback_action": (
+                                    visual_mask_fallback_action
+                                ),
                             },
                         )
 

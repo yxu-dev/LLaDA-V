@@ -141,10 +141,14 @@ class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
         profiler_callback = kwargs.get("profiler_callback")
         profiler_options = kwargs.get("profiler_options")
         intervention = kwargs.get("intervention")
+        transfer_policy_callback = kwargs.get("transfer_policy_callback")
+        visual_mask_policy_callback = kwargs.get("visual_mask_policy_callback")
         need_multimodal_layout = (
             profiler_callback is not None
             or profiler_options is not None
             or intervention is not None
+            or transfer_policy_callback is not None
+            or visual_mask_policy_callback is not None
         )
 
         if images is not None:
