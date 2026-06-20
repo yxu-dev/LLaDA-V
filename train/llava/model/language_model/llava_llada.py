@@ -138,10 +138,66 @@ class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
 
+        profiler_callback = kwargs.get("profiler_callback")
+        profiler_options = kwargs.get("profiler_options")
+        intervention = kwargs.get("intervention")
+        need_multimodal_layout = (
+            profiler_callback is not None
+            or profiler_options is not None
+            or intervention is not None
+        )
+
         if images is not None:
-            (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
+            prepared = self.prepare_inputs_labels_for_multimodal(
+                inputs,
+                position_ids,
+                attention_mask,
+                None,
+                None,
+                images,
+                modalities,
+                image_sizes=image_sizes,
+                return_multimodal_layout=need_multimodal_layout,
+            )
+            if need_multimodal_layout:
+                (
+                    inputs,
+                    position_ids,
+                    attention_mask,
+                    _,
+                    inputs_embeds,
+                    _,
+                    multimodal_layouts,
+                ) = prepared
+                kwargs["multimodal_layout"] = multimodal_layouts
+            else:
+                (
+                    inputs,
+                    position_ids,
+                    attention_mask,
+                    _,
+                    inputs_embeds,
+                    _,
+                ) = prepared
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
+            if need_multimodal_layout:
+                sequence_length = inputs_embeds.shape[1]
+                kwargs["multimodal_layout"] = [
+                    {
+                        "sequence_length": sequence_length,
+                        "prompt_text_spans": [(0, sequence_length)],
+                        "visual_spans": [],
+                        "generated_span": None,
+                        "suffix_span": None,
+                        "image_grid_shapes": [],
+                        "token_types": ["prompt_text"] * sequence_length,
+                        "padding_side": getattr(
+                            self.config, "tokenizer_padding_side", "right"
+                        ),
+                        "metadata": {},
+                    }
+                ]
 
         return super().generate_with_embeds(inputs_embeds=inputs_embeds, **kwargs)
 

@@ -74,6 +74,117 @@ def _get_unpad_data(attention_mask):
     )
 
 
+def _profiler_option(options, name, default=False):
+    if options is None:
+        return default
+    if isinstance(options, dict):
+        return options.get(name, default)
+    return getattr(options, name, default)
+
+
+def _selected_layer_outputs(values, selected_layers, hidden_states=False):
+    if values is None:
+        return None
+    if not selected_layers:
+        return values
+    offset = 1 if hidden_states else 0
+    return tuple(values[layer + offset] for layer in selected_layers)
+
+
+def _extend_multimodal_layouts(layouts, prompt_length, gen_length, suffix_length):
+    if layouts is None:
+        layouts = [
+            {
+                "sequence_length": prompt_length,
+                "prompt_text_spans": [(0, prompt_length)],
+                "visual_spans": [],
+                "generated_span": None,
+                "suffix_span": None,
+                "image_grid_shapes": [],
+                "token_types": ["prompt_text"] * prompt_length,
+                "padding_side": "right",
+                "metadata": {},
+            }
+        ]
+    extended = []
+    for layout in layouts:
+        current = dict(layout)
+        token_types = list(current.get("token_types", []))
+        if len(token_types) != prompt_length:
+            raise ValueError(
+                "multimodal layout length does not match prepared input embeddings"
+            )
+        generated_span = (prompt_length, prompt_length + gen_length)
+        suffix_span = (
+            (prompt_length + gen_length, prompt_length + gen_length + suffix_length)
+            if suffix_length > 0
+            else None
+        )
+        token_types.extend(["generated_masked"] * gen_length)
+        token_types.extend(["suffix"] * suffix_length)
+        current.update(
+            {
+                "sequence_length": len(token_types),
+                "generated_span": generated_span,
+                "suffix_span": suffix_span,
+                "token_types": token_types,
+            }
+        )
+        extended.append(current)
+    return extended
+
+
+def _intervention_attention_mask(
+    intervention,
+    layouts,
+    step,
+    batch_size,
+    sequence_length,
+    device,
+):
+    if not intervention or not intervention.get("enabled", False):
+        return None
+    if intervention.get("kind") != "visual_attention_mask":
+        raise ValueError(f"unsupported intervention kind: {intervention.get('kind')}")
+    apply_from_step = int(intervention.get("apply_from_step", 0))
+    apply_until_step = intervention.get("apply_until_step")
+    if step < apply_from_step or (
+        apply_until_step is not None and step > int(apply_until_step)
+    ):
+        return None
+    target_indices = [int(index) for index in intervention.get("target_indices", [])]
+    if not target_indices:
+        return None
+    attention_mask = torch.ones(
+        (batch_size, 1, sequence_length, sequence_length),
+        dtype=torch.bool,
+        device=device,
+    )
+    for batch_index in range(batch_size):
+        layout = layouts[min(batch_index, len(layouts) - 1)]
+        generated_span = layout.get("generated_span")
+        if generated_span is None:
+            raise ValueError("visual intervention requires a generated token span")
+        query_start, query_end = generated_span
+        visual_indices = {
+            index
+            for start, end in layout.get("visual_spans", [])
+            for index in range(start, end)
+        }
+        invalid = [index for index in target_indices if index not in visual_indices]
+        if invalid:
+            raise ValueError(
+                f"intervention target is outside visual spans: {invalid[:3]}"
+            )
+        attention_mask[
+            batch_index,
+            0,
+            query_start:query_end,
+            target_indices,
+        ] = False
+    return attention_mask
+
+
 class LLaDARMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -1299,8 +1410,25 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         return x
 
     @torch.no_grad()
-    def generate_with_embeds(self, inputs_embeds, steps=128, gen_length=128, block_length=128, temperature=0.,
-        cfg_scale=0., remasking='low_confidence', mask_id=126336, tokenizer=None, stopping_criteria=None, generation_suffix=None, **kwargs):
+    def generate_with_embeds(
+        self,
+        inputs_embeds,
+        steps=128,
+        gen_length=128,
+        block_length=128,
+        temperature=0.0,
+        cfg_scale=0.0,
+        remasking="low_confidence",
+        mask_id=126336,
+        tokenizer=None,
+        stopping_criteria=None,
+        generation_suffix=None,
+        profiler_callback=None,
+        profiler_options=None,
+        multimodal_layout=None,
+        intervention=None,
+        **kwargs,
+    ):
         '''
         Args:
             inputs_embeds: A tensor of shape (1, l, d).
@@ -1328,6 +1456,29 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                 suffix_len = suffix_embeds.shape[1]
             else:
                 suffix_len = 0
+
+            profiler_enabled = (
+                profiler_callback is not None
+                and _profiler_option(profiler_options, "enabled", True)
+            )
+            capture_logits = profiler_enabled and _profiler_option(
+                profiler_options, "capture_logits", True
+            )
+            capture_hidden_states = profiler_enabled and _profiler_option(
+                profiler_options, "capture_hidden_states", False
+            )
+            capture_attentions = profiler_enabled and _profiler_option(
+                profiler_options, "capture_attentions", False
+            )
+            selected_layers = tuple(
+                _profiler_option(profiler_options, "selected_layers", ())
+            )
+            extended_layouts = _extend_multimodal_layouts(
+                multimodal_layout,
+                inputs_embeds.shape[1],
+                gen_length,
+                suffix_len,
+            )
 
             # Create input in embedding space
             total_length = inputs_embeds.shape[1] + gen_length + suffix_len
@@ -1382,6 +1533,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                 num_transfer_tokens = self.get_num_transfer_tokens(block_mask_index, steps)
                 
                 for i in range(steps):
+                    global_step = num_block * steps + i
                     # Determine which positions are mask embeddings
                     mask_index = torch.all(torch.abs(x_embeds - masked_embed) < 1e-5, dim=2)
 
@@ -1399,14 +1551,37 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         break
                     
                     # Handle CFG
+                    intervention_mask = _intervention_attention_mask(
+                        intervention,
+                        extended_layouts,
+                        global_step,
+                        x_embeds.shape[0],
+                        x_embeds.shape[1],
+                        x_embeds.device,
+                    )
+                    model_kwargs = {}
+                    if intervention_mask is not None:
+                        model_kwargs["attention_mask"] = intervention_mask
+                    if capture_hidden_states:
+                        model_kwargs["output_hidden_states"] = True
+                        model_kwargs["return_dict"] = True
+                    if capture_attentions:
+                        model_kwargs["output_attentions"] = True
+                        model_kwargs["return_dict"] = True
                     if cfg_scale > 0.:
                         un_embeds = x_embeds.clone() # shape (1, l + gen_length + suffix_len, d)
                         un_mask = prompt_index.unsqueeze(-1).expand_as(x_embeds)  # shape (1, l + gen_length + suffix_len, d)
                         un_embeds[un_mask] = masked_embed.repeat(x_embeds.shape[0],x_embeds.shape[1],1)[un_mask] # Use repeat to avoid the complexity of expand_as
                         combined_embeds = torch.cat([x_embeds, un_embeds], dim=0)
+                        if intervention_mask is not None:
+                            model_kwargs["attention_mask"] = torch.cat(
+                                [intervention_mask, intervention_mask], dim=0
+                            )
                         
                         # Forward pass
-                        outputs = self.model(inputs_embeds=combined_embeds)
+                        outputs = self.model(
+                            inputs_embeds=combined_embeds, **model_kwargs
+                        )
                         logits = self.lm_head(outputs[0]).float()
                         
                         # Split and apply CFG
@@ -1414,7 +1589,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                     else:
                         # Forward pass
-                        outputs = self.model(inputs_embeds=x_embeds)
+                        outputs = self.model(inputs_embeds=x_embeds, **model_kwargs)
                         logits = self.lm_head(outputs[0]).float()
                     
                     for token_id in [126081, 126080, 126346, 126347]:
@@ -1458,9 +1633,75 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         _, select_index = torch.topk(confidence[j], k=num_transfer_tokens[j, i])
                         transfer_index[j, select_index] = True
                     
+                    input_ids_before = x.detach().clone() if profiler_enabled else None
+
                     # Update embeddings and token IDs
                     x_embeds[transfer_index] = x0_embeds[transfer_index]
                     x[transfer_index] = x0[transfer_index]
+
+                    if profiler_enabled:
+                        mask_state_after = torch.all(
+                            torch.abs(x_embeds - masked_embed) < 1e-5, dim=2
+                        )
+                        hidden_states = _selected_layer_outputs(
+                            getattr(outputs, "hidden_states", None),
+                            selected_layers,
+                            hidden_states=True,
+                        )
+                        attentions = _selected_layer_outputs(
+                            getattr(outputs, "attentions", None),
+                            selected_layers,
+                            hidden_states=False,
+                        )
+                        if cfg_scale > 0.0:
+                            hidden_states = (
+                                tuple(
+                                    value[: inputs_embeds.shape[0]]
+                                    for value in hidden_states
+                                )
+                                if hidden_states is not None
+                                else None
+                            )
+                            attentions = (
+                                tuple(
+                                    value[: inputs_embeds.shape[0]]
+                                    for value in attentions
+                                )
+                                if attentions is not None
+                                else None
+                            )
+                        profiler_callback(
+                            step=global_step,
+                            block=num_block,
+                            input_ids=x.detach().clone(),
+                            input_ids_before=input_ids_before,
+                            input_ids_after=x.detach().clone(),
+                            logits=logits.detach() if capture_logits else None,
+                            hidden_states=hidden_states,
+                            attentions=attentions,
+                            past_key_values=getattr(outputs, "past_key_values", None),
+                            mask_state=mask_state_after.detach().clone(),
+                            mask_state_before=mask_index.detach().clone(),
+                            mask_state_after=mask_state_after.detach().clone(),
+                            mask_index=mask_index.detach().clone(),
+                            predictions=x0.detach().clone(),
+                            confidence=confidence.detach().clone(),
+                            transfer_index=transfer_index.detach().clone(),
+                            multimodal_layout=extended_layouts,
+                            metadata={
+                                "block_step": i,
+                                "steps_per_block": steps,
+                                "prompt_length": inputs_embeds.shape[1],
+                                "gen_length": gen_length,
+                                "block_length": block_length,
+                                "suffix_length": suffix_len,
+                                "selected_layers": selected_layers,
+                                "attention_backend": getattr(
+                                    self.config, "_attn_implementation", None
+                                ),
+                                "intervention_applied": intervention_mask is not None,
+                            },
+                        )
 
                     # New: Check for stop words after each update
                     if stopping_criteria is not None:

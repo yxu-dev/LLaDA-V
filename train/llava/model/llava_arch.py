@@ -31,6 +31,68 @@ from llava.utils import rank0_print, rank_print
 import random
 
 
+def _contiguous_spans(token_types, target):
+    spans = []
+    start = None
+    for index, token_type in enumerate(token_types):
+        if token_type == target and start is None:
+            start = index
+        elif token_type != target and start is not None:
+            spans.append((start, index))
+            start = None
+    if start is not None:
+        spans.append((start, len(token_types)))
+    return spans
+
+
+def _infer_visual_grid_shape(token_count):
+    side = int(math.isqrt(token_count))
+    if side * side == token_count:
+        return (side, side)
+    return (1, token_count)
+
+
+def _truncate_spans(spans, max_length):
+    if max_length is None:
+        return list(spans)
+    return [
+        (start, min(end, max_length))
+        for start, end in spans
+        if start < max_length
+    ]
+
+
+def _shift_spans(spans, offset):
+    return [(start + offset, end + offset) for start, end in spans]
+
+
+def _build_multimodal_layout(
+    token_types,
+    image_grid_shapes,
+    padding_side,
+    visual_spans=None,
+):
+    if visual_spans is None:
+        visual_spans = _contiguous_spans(token_types, "visual")
+    return {
+        "sequence_length": len(token_types),
+        "prompt_text_spans": _contiguous_spans(token_types, "prompt_text"),
+        "visual_spans": visual_spans,
+        "generated_span": None,
+        "suffix_span": None,
+        "image_grid_shapes": image_grid_shapes,
+        "token_types": token_types,
+        "padding_side": padding_side,
+        "metadata": {
+            "grid_shape_kind": "exact_if_square_otherwise_flattened",
+            "visual_token_counts": [
+                end - start
+                for start, end in visual_spans
+            ],
+        },
+    }
+
+
 class LlavaMetaModel:
 
     def __init__(self, config):
@@ -347,11 +409,42 @@ class LlavaMetaForCausalLM(ABC):
         
         return conversation_ids
 
-    def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None, is_llada=False):
+    def prepare_inputs_labels_for_multimodal(
+        self,
+        input_ids,
+        position_ids,
+        attention_mask,
+        past_key_values,
+        labels,
+        images,
+        modalities=["image"],
+        image_sizes=None,
+        is_llada=False,
+        return_multimodal_layout=False,
+    ):
         vision_tower = self.get_vision_tower()
         # rank_print(modalities)
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
-            return input_ids, position_ids, attention_mask, past_key_values, None, labels
+            result = (input_ids, position_ids, attention_mask, past_key_values, None, labels)
+            if not return_multimodal_layout:
+                return result
+            layouts = []
+            for batch_index in range(input_ids.shape[0]):
+                if attention_mask is None:
+                    valid = [True] * input_ids.shape[1]
+                else:
+                    valid = attention_mask[batch_index].bool().tolist()
+                token_types = [
+                    "prompt_text" if is_valid else "padding" for is_valid in valid
+                ]
+                layouts.append(
+                    _build_multimodal_layout(
+                        token_types,
+                        image_grid_shapes=[],
+                        padding_side=getattr(self.config, "tokenizer_padding_side", "right"),
+                    )
+                )
+            return (*result, layouts)
 
         if isinstance(modalities, str):
             modalities = [modalities]
@@ -543,6 +636,8 @@ class LlavaMetaForCausalLM(ABC):
 
         new_input_embeds = []
         new_labels = []
+        new_token_types = []
+        new_visual_spans = []
         cur_image_idx = 0
         # rank_print("Inserting Images embedding")
         for batch_idx, cur_input_ids in enumerate(input_ids):
@@ -554,6 +649,8 @@ class LlavaMetaForCausalLM(ABC):
                 cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
                 new_input_embeds.append(cur_input_embeds)
                 new_labels.append(labels[batch_idx])
+                new_token_types.append(["prompt_text"] * cur_input_embeds.shape[0])
+                new_visual_spans.append([])
                 cur_image_idx += 1
                 continue
 
@@ -569,10 +666,17 @@ class LlavaMetaForCausalLM(ABC):
             cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
             cur_new_input_embeds = []
             cur_new_labels = []
+            cur_new_token_types = []
+            cur_visual_spans = []
+            cur_position = 0
 
             for i in range(num_images + 1):
                 cur_new_input_embeds.append(cur_input_embeds_no_im[i])
                 cur_new_labels.append(cur_labels_noim[i])
+                cur_new_token_types.extend(
+                    ["prompt_text"] * cur_input_embeds_no_im[i].shape[0]
+                )
+                cur_position += cur_input_embeds_no_im[i].shape[0]
                 if i < num_images:
                     try:
                         cur_image_features = image_features[cur_image_idx]
@@ -581,6 +685,13 @@ class LlavaMetaForCausalLM(ABC):
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+                    cur_new_token_types.extend(
+                        ["visual"] * cur_image_features.shape[0]
+                    )
+                    cur_visual_spans.append(
+                        (cur_position, cur_position + cur_image_features.shape[0])
+                    )
+                    cur_position += cur_image_features.shape[0]
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
 
@@ -590,6 +701,8 @@ class LlavaMetaForCausalLM(ABC):
 
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
+            new_token_types.append(cur_new_token_types)
+            new_visual_spans.append(cur_visual_spans)
 
         # Truncate sequences to max length as image embeddings can make the sequence longer
         tokenizer_model_max_length = getattr(self.config, "tokenizer_model_max_length", None)
@@ -597,6 +710,15 @@ class LlavaMetaForCausalLM(ABC):
 
         new_input_embeds = [x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
         new_labels = [x[:tokenizer_model_max_length] for x, modality in zip(new_labels, modalities)]
+        new_token_types = [
+            token_types[:tokenizer_model_max_length]
+            for token_types, modality in zip(new_token_types, modalities)
+        ]
+        if tokenizer_model_max_length is not None:
+            new_visual_spans = [
+                _truncate_spans(spans, tokenizer_model_max_length)
+                for spans in new_visual_spans
+            ]
         # TODO: Hard code for control loss spike
         # if tokenizer_model_max_length is not None:
         #     new_input_embeds = [x[:4096] if modality != "video" else x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
@@ -607,6 +729,8 @@ class LlavaMetaForCausalLM(ABC):
         batch_size = len(new_input_embeds)
 
         new_input_embeds_padded = []
+        token_types_padded = []
+        visual_spans_padded = []
         new_labels_padded = torch.full((batch_size, max_len), IGNORE_INDEX, dtype=new_labels[0].dtype, device=new_labels[0].device)
         attention_mask = torch.zeros((batch_size, max_len), dtype=attention_mask.dtype, device=attention_mask.device)
         position_ids = torch.zeros((batch_size, max_len), dtype=position_ids.dtype, device=position_ids.device)
@@ -616,12 +740,23 @@ class LlavaMetaForCausalLM(ABC):
             cur_len = cur_new_embed.shape[0]
             if getattr(self.config, "tokenizer_padding_side", "right") == "left":
                 new_input_embeds_padded.append(torch.cat((torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device), cur_new_embed), dim=0))
+                token_types_padded.append(
+                    ["padding"] * (max_len - cur_len) + new_token_types[i]
+                )
+                padding_length = max_len - cur_len
+                visual_spans_padded.append(
+                    _shift_spans(new_visual_spans[i], padding_length)
+                )
                 if cur_len > 0:
                     new_labels_padded[i, -cur_len:] = cur_new_labels
                     attention_mask[i, -cur_len:] = True
                     position_ids[i, -cur_len:] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
             else:
                 new_input_embeds_padded.append(torch.cat((cur_new_embed, torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), dtype=cur_new_embed.dtype, device=cur_new_embed.device)), dim=0))
+                token_types_padded.append(
+                    new_token_types[i] + ["padding"] * (max_len - cur_len)
+                )
+                visual_spans_padded.append(list(new_visual_spans[i]))
                 if cur_len > 0:
                     new_labels_padded[i, :cur_len] = cur_new_labels
                     attention_mask[i, :cur_len] = True
@@ -649,14 +784,44 @@ class LlavaMetaForCausalLM(ABC):
             right_add = random.randint(left_add, self.config.pos_skipping_range)
             position_ids[:, :split_position] += left_add
             position_ids[:, split_position:] += right_add
+
+        multimodal_layouts = [
+            _build_multimodal_layout(
+                token_types,
+                image_grid_shapes=[
+                    _infer_visual_grid_shape(end - start)
+                    for start, end in visual_spans_padded[index]
+                ],
+                padding_side=getattr(self.config, "tokenizer_padding_side", "right"),
+                visual_spans=visual_spans_padded[index],
+            )
+            for index, token_types in enumerate(token_types_padded)
+        ]
         
         # add conversation_ids 
         if is_llada and attention_mask is not None: 
             conversation_ids = self.generate_conversation_ids(new_labels)
-            return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, conversation_ids
+            result = (
+                None,
+                position_ids,
+                attention_mask,
+                past_key_values,
+                new_input_embeds,
+                new_labels,
+                conversation_ids,
+            )
+            return (*result, multimodal_layouts) if return_multimodal_layout else result
         # import pdb; pdb.set_trace()
         # rank0_print("Finish preparing")
-        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
+        result = (
+            None,
+            position_ids,
+            attention_mask,
+            past_key_values,
+            new_input_embeds,
+            new_labels,
+        )
+        return (*result, multimodal_layouts) if return_multimodal_layout else result
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         if model_args.mm_use_im_patch_token:
