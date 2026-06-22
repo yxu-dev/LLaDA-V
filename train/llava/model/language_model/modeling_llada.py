@@ -92,6 +92,41 @@ def _selected_layer_outputs(values, selected_layers, hidden_states=False):
     return tuple(values[layer + offset] for layer in selected_layers)
 
 
+def _requested_layer_outputs(values, requested_layers, selected_layers):
+    if values is None:
+        return None
+    if not selected_layers:
+        return values
+    positions = {layer: index for index, layer in enumerate(requested_layers)}
+    missing = [layer for layer in selected_layers if layer not in positions]
+    if missing:
+        raise ValueError(
+            f"selected attention layers were not requested: {missing}"
+        )
+    return tuple(values[positions[layer]] for layer in selected_layers)
+
+
+def _selected_token_probabilities(logits, token_ids, chunk_size=32):
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if logits.shape[:-1] != token_ids.shape:
+        raise ValueError("token_ids must match logits without the vocabulary axis")
+    probabilities = torch.empty(
+        token_ids.shape,
+        dtype=torch.float64,
+        device=logits.device,
+    )
+    for start in range(0, logits.shape[1], chunk_size):
+        end = min(start + chunk_size, logits.shape[1])
+        chunk = logits[:, start:end].to(torch.float64)
+        probabilities[:, start:end] = torch.gather(
+            F.softmax(chunk, dim=-1),
+            dim=-1,
+            index=token_ids[:, start:end].unsqueeze(-1),
+        ).squeeze(-1)
+    return probabilities
+
+
 def _layout_fixed_positions(layouts, batch_size, sequence_length, device):
     fixed = torch.zeros(
         (batch_size, sequence_length),
@@ -1183,6 +1218,7 @@ class LLaDAModel(LLaDAPreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
+        output_attention_layers: Optional[Tuple[int, ...]] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
@@ -1192,6 +1228,20 @@ class LLaDAModel(LLaDAPreTrainedModel):
         assert (past_key_values is None and not use_cache), "The kvcache is not suppotred for MDM."
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        requested_attention_layers = None
+        if output_attentions and output_attention_layers is not None:
+            requested_attention_layers = tuple(
+                sorted({int(layer) for layer in output_attention_layers})
+            )
+            invalid_layers = [
+                layer
+                for layer in requested_attention_layers
+                if not 0 <= layer < len(self.layers)
+            ]
+            if invalid_layers:
+                raise ValueError(
+                    f"output_attention_layers contains invalid layers: {invalid_layers}"
+                )
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -1238,10 +1288,14 @@ class LLaDAModel(LLaDAPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        for layer_index, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            layer_output_attentions = output_attentions and (
+                requested_attention_layers is None
+                or layer_index in requested_attention_layers
+            )
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
@@ -1249,7 +1303,7 @@ class LLaDAModel(LLaDAPreTrainedModel):
                     causal_mask,
                     position_ids,
                     past_key_values,
-                    output_attentions,
+                    layer_output_attentions,
                     use_cache,
                     cache_position,
                     **kwargs,
@@ -1260,7 +1314,7 @@ class LLaDAModel(LLaDAPreTrainedModel):
                     attention_mask=causal_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
-                    output_attentions=output_attentions,
+                    output_attentions=layer_output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
                     **kwargs,
@@ -1269,9 +1323,11 @@ class LLaDAModel(LLaDAPreTrainedModel):
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+                next_decoder_cache = layer_outputs[
+                    2 if layer_output_attentions else 1
+                ]
 
-            if output_attentions:
+            if layer_output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
@@ -1738,6 +1794,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     if dynamic_visual_mask is not None:
                         intervention_mask = dynamic_visual_mask
                     model_kwargs = {}
+                    requested_attention_layers = ()
                     if intervention_mask is not None:
                         model_kwargs["attention_mask"] = intervention_mask
                     if capture_hidden_states:
@@ -1746,12 +1803,23 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     if capture_attentions:
                         model_kwargs["output_attentions"] = True
                         model_kwargs["return_dict"] = True
+                        requested_attention_layers = selected_layers
                     if (
                         visual_mask_policy_callback is not None
                         and global_step == visual_mask_policy_step
                     ):
                         model_kwargs["output_attentions"] = True
                         model_kwargs["return_dict"] = True
+                        requested_attention_layers = tuple(
+                            sorted(
+                                set(requested_attention_layers)
+                                | {visual_mask_policy_layer}
+                            )
+                        )
+                    if requested_attention_layers:
+                        model_kwargs["output_attention_layers"] = (
+                            requested_attention_layers
+                        )
                     if cfg_scale > 0.:
                         un_embeds = x_embeds.clone() # shape (1, l + gen_length + suffix_len, d)
                         un_mask = prompt_index.unsqueeze(-1).expand_as(x_embeds)  # shape (1, l + gen_length + suffix_len, d)
@@ -1785,9 +1853,10 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     
                     # Get confidence scores
                     if remasking == 'low_confidence':
-                        p = F.softmax(logits.to(torch.float64), dim=-1) # shape (1, l + gen_length + suffix_len, vocab_size)
-                        x0_p = torch.squeeze(
-                            torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1) # 1, l + gen_length + suffix_len represents the confidence of each x0
+                        x0_p = _selected_token_probabilities(
+                            logits,
+                            x0,
+                        )
                     elif remasking == 'random':
                         x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
                     else:
@@ -1900,7 +1969,9 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                                 "dynamic B4 ranking attention was not returned"
                             )
                         ranking_attention = all_attentions[
-                            visual_mask_policy_layer
+                            requested_attention_layers.index(
+                                visual_mask_policy_layer
+                            )
                         ]
                         if cfg_scale > 0.0:
                             ranking_attention = ranking_attention[
@@ -1955,10 +2026,10 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                             selected_layers,
                             hidden_states=True,
                         )
-                        attentions = _selected_layer_outputs(
+                        attentions = _requested_layer_outputs(
                             getattr(outputs, "attentions", None),
+                            requested_attention_layers,
                             selected_layers,
-                            hidden_states=False,
                         )
                         if cfg_scale > 0.0:
                             hidden_states = (
