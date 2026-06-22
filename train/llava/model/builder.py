@@ -245,6 +245,11 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                     for k, v in overwrite_config.items():
                         setattr(llada_cfg, k, v)
 
+                # When an explicit config object is passed, Transformers may
+                # auto-select SDPA before constructing the decoder layers.
+                # Pin the requested implementation on the config itself so
+                # layer construction and the caller's backend agree.
+                llada_cfg._attn_implementation = attn_implementation
                 model = LlavaLLaDAModelLM.from_pretrained(model_path, low_cpu_mem_usage=True, attn_implementation=attn_implementation, config=llada_cfg, **kwargs)
 
             else:
