@@ -1793,6 +1793,19 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         )
                     if dynamic_visual_mask is not None:
                         intervention_mask = dynamic_visual_mask
+                        marker = getattr(
+                            visual_mask_policy_callback,
+                            "mark_backend_mask_applied",
+                            None,
+                        )
+                        if callable(marker):
+                            marker(
+                                step=global_step,
+                                activation_step=visual_mask_activation_step,
+                                selected_visual_key_count=int(
+                                    selected_visual_keys.sum().item()
+                                ),
+                            )
                     model_kwargs = {}
                     requested_attention_layers = ()
                     if intervention_mask is not None:
@@ -1804,10 +1817,15 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         model_kwargs["output_attentions"] = True
                         model_kwargs["return_dict"] = True
                         requested_attention_layers = selected_layers
-                    if (
+                    visual_policy_active = (
                         visual_mask_policy_callback is not None
-                        and global_step == visual_mask_policy_step
-                    ):
+                        and (
+                            visual_mask_policy_step is None
+                            or visual_mask_policy_step < 0
+                            or global_step == visual_mask_policy_step
+                        )
+                    )
+                    if visual_policy_active:
                         model_kwargs["output_attentions"] = True
                         model_kwargs["return_dict"] = True
                         requested_attention_layers = tuple(
@@ -1959,10 +1977,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     x_embeds[transfer_index] = x0_embeds[transfer_index]
                     x[transfer_index] = x0[transfer_index]
 
-                    if (
-                        visual_mask_policy_callback is not None
-                        and global_step == visual_mask_policy_step
-                    ):
+                    if visual_policy_active:
                         all_attentions = getattr(outputs, "attentions", None)
                         if all_attentions is None:
                             raise RuntimeError(
@@ -1983,6 +1998,11 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                             attention=ranking_attention.detach().clone(),
                             input_ids=x.detach().clone(),
                             mask_state=mask_index.detach().clone(),
+                            predictions=x0.detach().clone(),
+                            confidence=confidence.detach().clone(),
+                            vanilla_transfer_index=(
+                                vanilla_transfer_index.detach().clone()
+                            ),
                             multimodal_layout=copy.deepcopy(extended_layouts),
                             metadata={
                                 "activation_step": global_step + 1,
