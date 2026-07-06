@@ -1666,7 +1666,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         "dynamic B4 callback requires eager attention backend"
                     )
                 if not isinstance(visual_mask_policy_step, int) or not (
-                    0 <= visual_mask_policy_step < steps
+                    visual_mask_policy_step == -1
+                    or 0 <= visual_mask_policy_step < steps
                 ):
                     raise ValueError(
                         "visual_mask_policy_step must be a valid global step"
