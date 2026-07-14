@@ -1740,6 +1740,9 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             feature_cache.reset_cache(inputs_embeds.shape[1])
             selected_visual_keys = None
             visual_mask_activation_step = None
+            visual_mask_proposal_id = None
+            visual_mask_policy_decision_step = None
+            visual_mask_proposal_event_recorded = False
             visual_mask_fallback_action = None
             visual_mask_participation_proxy = 0.0
             for num_block in range(num_blocks):
@@ -1792,6 +1795,15 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                             sequence_length=x_embeds.shape[1],
                             device=x_embeds.device,
                         )
+                    observation_mask_applied = dynamic_visual_mask is not None
+                    observation_source_proposal_id = (
+                        visual_mask_proposal_id if observation_mask_applied else None
+                    )
+                    observation_applied_visual_key_count = (
+                        int(selected_visual_keys.sum().item())
+                        if observation_mask_applied and selected_visual_keys is not None
+                        else 0
+                    )
                     if dynamic_visual_mask is not None:
                         intervention_mask = dynamic_visual_mask
                         marker = getattr(
@@ -1800,13 +1812,31 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                             None,
                         )
                         if callable(marker):
-                            marker(
-                                step=global_step,
-                                activation_step=visual_mask_activation_step,
-                                selected_visual_key_count=int(
-                                    selected_visual_keys.sum().item()
-                                ),
-                            )
+                            if (
+                                visual_mask_proposal_id is not None
+                                and not visual_mask_proposal_event_recorded
+                            ):
+                                marker(
+                                    proposal_id=visual_mask_proposal_id,
+                                    policy_decision_step=(
+                                        visual_mask_policy_decision_step
+                                    ),
+                                    activation_step=visual_mask_activation_step,
+                                    mask_applied_step=global_step,
+                                    selected_visual_key_count=(
+                                        observation_applied_visual_key_count
+                                    ),
+                                )
+                                visual_mask_proposal_event_recorded = True
+                            else:
+                                if visual_mask_proposal_id is None:
+                                    marker(
+                                        step=global_step,
+                                        activation_step=visual_mask_activation_step,
+                                        selected_visual_key_count=(
+                                            observation_applied_visual_key_count
+                                        ),
+                                    )
                     model_kwargs = {}
                     requested_attention_layers = ()
                     if intervention_mask is not None:
@@ -2001,6 +2031,13 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                             mask_state=mask_index.detach().clone(),
                             predictions=x0.detach().clone(),
                             confidence=confidence.detach().clone(),
+                            observation_mask_applied=observation_mask_applied,
+                            observation_source_proposal_id=(
+                                observation_source_proposal_id
+                            ),
+                            observation_applied_visual_key_count=(
+                                observation_applied_visual_key_count
+                            ),
                             vanilla_transfer_index=(
                                 vanilla_transfer_index.detach().clone()
                             ),
@@ -2020,6 +2057,34 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                             device=x_embeds.device,
                         )
                         visual_mask_activation_step = global_step + 1
+                        proposal_metadata_reader = getattr(
+                            visual_mask_policy_callback,
+                            "get_latest_proposal_metadata",
+                            None,
+                        )
+                        proposal_metadata = (
+                            proposal_metadata_reader()
+                            if callable(proposal_metadata_reader)
+                            else None
+                        )
+                        if proposal_metadata:
+                            visual_mask_proposal_id = proposal_metadata.get(
+                                "proposal_id"
+                            )
+                            visual_mask_policy_decision_step = proposal_metadata.get(
+                                "policy_decision_step"
+                            )
+                            visual_mask_activation_step = int(
+                                proposal_metadata.get(
+                                    "activation_step",
+                                    visual_mask_activation_step,
+                                )
+                            )
+                            visual_mask_proposal_event_recorded = False
+                        else:
+                            visual_mask_proposal_id = None
+                            visual_mask_policy_decision_step = None
+                            visual_mask_proposal_event_recorded = False
                         target_count = int(selected_visual_keys.sum().item())
                         visual_count = sum(
                             end - start
@@ -2120,6 +2185,9 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                                 ),
                                 "visual_mask_activation_step": (
                                     visual_mask_activation_step
+                                ),
+                                "visual_mask_proposal_id": (
+                                    visual_mask_proposal_id
                                 ),
                                 "visual_mask_target_count": (
                                     int(selected_visual_keys.sum().item())
