@@ -629,6 +629,16 @@ class LLaDAAttention(nn.Module):
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
+        visual_rewrite_context = kwargs.get("visual_rewrite_context")
+        if visual_rewrite_context is not None:
+            visual_indices = visual_rewrite_context["visual_indices"]
+            visual_rewrite_context.setdefault("pending_visual_kv", {})[
+                self.layer_idx
+            ] = {
+                "key": key_states.index_select(2, visual_indices).detach().clone(),
+                "value": value_states.index_select(2, visual_indices).detach().clone(),
+            }
+
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -669,6 +679,96 @@ class LLaDAAttention(nn.Module):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
+
+    def forward_visual_reuse(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        nonvisual_indices: torch.LongTensor,
+        visual_indices: torch.LongTensor,
+        cached_visual_key: torch.Tensor,
+        cached_visual_value: torch.Tensor,
+        sequence_length: int,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        output_attentions: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Run eager attention queries only for non-visual rows.
+
+        Visual keys and values remain fully readable and retain their original
+        sequence positions.  This path intentionally supports only the Phase
+        3.0 correctness backend (batch one, eager attention, no TP slicing).
+        """
+        if self.config.pretraining_tp != 1:
+            raise RuntimeError("Visual Rewrite requires pretraining_tp=1")
+        batch, query_length, _ = hidden_states.size()
+        if batch != 1:
+            raise RuntimeError("Visual Rewrite Phase 3.0 requires batch size 1")
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+        query_states = query_states.view(
+            batch, query_length, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = key_states.view(
+            batch, query_length, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            batch, query_length, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+
+        selected_position_ids = (
+            position_ids.index_select(1, nonvisual_indices)
+            if position_ids is not None
+            else None
+        )
+        cosine, sine = self.rotary_emb(value_states, selected_position_ids)
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cosine, sine
+        )
+
+        full_key = key_states.new_empty(
+            batch, self.num_key_value_heads, sequence_length, self.head_dim
+        )
+        full_value = value_states.new_empty(
+            batch, self.num_key_value_heads, sequence_length, self.head_dim
+        )
+        full_key.index_copy_(2, nonvisual_indices, key_states)
+        full_value.index_copy_(2, nonvisual_indices, value_states)
+        full_key.index_copy_(2, visual_indices, cached_visual_key)
+        full_value.index_copy_(2, visual_indices, cached_visual_value)
+        repeated_key = repeat_kv(full_key, self.num_key_value_groups)
+        repeated_value = repeat_kv(full_value, self.num_key_value_groups)
+
+        attention_weights = torch.matmul(
+            query_states, repeated_key.transpose(2, 3)
+        ) / math.sqrt(self.head_dim)
+        if attention_mask is not None:
+            selected_mask = attention_mask.index_select(-2, nonvisual_indices)
+            attention_weights = attention_weights + selected_mask[..., :sequence_length]
+        attention_weights = nn.functional.softmax(
+            attention_weights, dim=-1, dtype=torch.float32
+        ).to(query_states.dtype)
+        attention_weights = nn.functional.dropout(
+            attention_weights,
+            p=self.attention_dropout,
+            training=self.training,
+        )
+        attention_output = torch.matmul(attention_weights, repeated_value)
+        attention_output = attention_output.transpose(1, 2).contiguous()
+        attention_output = attention_output.reshape(
+            batch, query_length, self.hidden_size
+        )
+        attention_output = self.o_proj(attention_output)
+
+        if not output_attentions:
+            return attention_output, None
+        full_attention = attention_weights.new_zeros(
+            batch, self.num_heads, sequence_length, sequence_length
+        )
+        full_attention.index_copy_(2, nonvisual_indices, attention_weights)
+        return attention_output, full_attention
 
 
 class LLaDAFlashAttention2(LLaDAAttention):
@@ -982,6 +1082,7 @@ class LLaDADecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
+        visual_rewrite_context=None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -1003,6 +1104,59 @@ class LLaDADecoderLayer(nn.Module):
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
             )
 
+        if visual_rewrite_context is not None and visual_rewrite_context[
+            "applied_action"
+        ] == "reuse":
+            cache_entry = visual_rewrite_context["cache"][self.self_attn.layer_idx]
+            visual_indices = visual_rewrite_context["visual_indices"]
+            nonvisual_indices = visual_rewrite_context["nonvisual_indices"]
+            residual_nonvisual = hidden_states.index_select(1, nonvisual_indices)
+            normalized_nonvisual = self.input_layernorm(residual_nonvisual)
+            attention_output, self_attn_weights = self.self_attn.forward_visual_reuse(
+                normalized_nonvisual,
+                nonvisual_indices=nonvisual_indices,
+                visual_indices=visual_indices,
+                cached_visual_key=cache_entry["visual_key"],
+                cached_visual_value=cache_entry["visual_value"],
+                sequence_length=hidden_states.shape[1],
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                output_attentions=output_attentions,
+            )
+            nonvisual_hidden = residual_nonvisual + attention_output
+            nonvisual_hidden = nonvisual_hidden + self.mlp(
+                self.post_attention_layernorm(nonvisual_hidden)
+            )
+            hidden_states = cache_entry["visual_output"].new_empty(
+                hidden_states.shape
+            )
+            hidden_states.index_copy_(
+                1, visual_indices, cache_entry["visual_output"]
+            )
+            hidden_states.index_copy_(1, nonvisual_indices, nonvisual_hidden)
+            present_key_value = None
+            visual_rewrite_context["audit"].append(
+                {
+                    "step": visual_rewrite_context["step"],
+                    "block": visual_rewrite_context["block"],
+                    "block_step": visual_rewrite_context["block_step"],
+                    "layer": self.self_attn.layer_idx,
+                    "requested_action": visual_rewrite_context["requested_action"],
+                    "applied_action": "reuse",
+                    "fallback_reason": None,
+                    "cache_generation": visual_rewrite_context["cache_generation"],
+                    "visual_query_projected": False,
+                    "visual_mlp_executed": False,
+                    "full_visual_kv_readable": True,
+                }
+            )
+            outputs = (hidden_states,)
+            if output_attentions:
+                outputs += (self_attn_weights,)
+            if use_cache:
+                outputs += (present_key_value,)
+            return outputs
+
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -1016,6 +1170,7 @@ class LLaDADecoderLayer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
+            visual_rewrite_context=visual_rewrite_context,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -1025,6 +1180,34 @@ class LLaDADecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+
+        if visual_rewrite_context is not None:
+            layer_index = self.self_attn.layer_idx
+            visual_indices = visual_rewrite_context["visual_indices"]
+            pending = visual_rewrite_context["pending_visual_kv"].pop(layer_index)
+            visual_rewrite_context["cache"][layer_index] = {
+                "visual_output": hidden_states.index_select(
+                    1, visual_indices
+                ).detach().clone(),
+                "visual_key": pending["key"],
+                "visual_value": pending["value"],
+                "metadata": dict(visual_rewrite_context["cache_metadata"]),
+            }
+            visual_rewrite_context["audit"].append(
+                {
+                    "step": visual_rewrite_context["step"],
+                    "block": visual_rewrite_context["block"],
+                    "block_step": visual_rewrite_context["block_step"],
+                    "layer": layer_index,
+                    "requested_action": visual_rewrite_context["requested_action"],
+                    "applied_action": "refresh",
+                    "fallback_reason": visual_rewrite_context["fallback_reason"],
+                    "cache_generation": visual_rewrite_context["cache_generation"],
+                    "visual_query_projected": True,
+                    "visual_mlp_executed": True,
+                    "full_visual_kv_readable": True,
+                }
+            )
 
         outputs = (hidden_states,)
 
@@ -1607,6 +1790,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         visual_mask_policy_callback=None,
         visual_mask_policy_step=None,
         visual_mask_policy_layer=None,
+        visual_rewrite_action_callback=None,
+        visual_rewrite_audit_callback=None,
         **kwargs,
     ):
         '''
@@ -1685,6 +1870,15 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     raise ValueError(
                         "visual_mask_policy_layer must identify an existing layer"
                     )
+            if visual_rewrite_action_callback is not None:
+                if cfg_scale != 0.0:
+                    raise ValueError("Visual Rewrite Phase 3.0 requires cfg_scale=0")
+                if inputs_embeds.shape[0] != 1:
+                    raise ValueError("Visual Rewrite Phase 3.0 requires batch size 1")
+                if getattr(self.config, "_attn_implementation", None) != "eager":
+                    raise ValueError("Visual Rewrite Phase 3.0 requires eager attention")
+                if int(getattr(self.config, "pretraining_tp", 1)) != 1:
+                    raise ValueError("Visual Rewrite Phase 3.0 requires pretraining_tp=1")
             extended_layouts = _extend_multimodal_layouts(
                 multimodal_layout,
                 inputs_embeds.shape[1],
@@ -1718,6 +1912,51 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             prompt_index = torch.zeros((1, total_length), dtype=torch.bool, device=inputs_embeds.device)
             prompt_index[:, :inputs_embeds.shape[1]] = 1 # shape (1, l + gen_length + suffix_len)
 
+            visual_rewrite_cache = {}
+            visual_rewrite_cache_generation = 0
+            visual_indices = None
+            nonvisual_indices = None
+            visual_layout_signature = None
+            visual_rewrite_generation = f"generation-{id(x_embeds)}"
+            if visual_rewrite_action_callback is not None:
+                if not extended_layouts or len(extended_layouts) != 1:
+                    raise ValueError(
+                        "Visual Rewrite requires exactly one multimodal layout"
+                    )
+                visual_spans = tuple(
+                    (int(start), int(end))
+                    for start, end in extended_layouts[0].get("visual_spans", [])
+                )
+                visual_positions = [
+                    index
+                    for start, end in visual_spans
+                    for index in range(start, end)
+                ]
+                if not visual_positions or len(set(visual_positions)) != len(
+                    visual_positions
+                ):
+                    raise ValueError("Visual Rewrite requires non-overlapping visual spans")
+                if min(visual_positions) < 0 or max(visual_positions) >= total_length:
+                    raise ValueError("Visual Rewrite visual span is outside the sequence")
+                visual_position_set = set(visual_positions)
+                nonvisual_positions = [
+                    index
+                    for index in range(total_length)
+                    if index not in visual_position_set
+                ]
+                visual_indices = torch.tensor(
+                    visual_positions, dtype=torch.long, device=x_embeds.device
+                )
+                nonvisual_indices = torch.tensor(
+                    nonvisual_positions, dtype=torch.long, device=x_embeds.device
+                )
+                visual_layout_signature = (
+                    total_length,
+                    visual_spans,
+                    tuple(extended_layouts[0].get("generated_span") or ()),
+                    tuple(extended_layouts[0].get("suffix_span") or ()),
+                )
+
             assert gen_length % block_length == 0
             num_blocks = gen_length // block_length
 
@@ -1750,6 +1989,11 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                 block_start = inputs_embeds.shape[1] + num_block * block_length
                 block_end = inputs_embeds.shape[1] + (num_block + 1) * block_length
 
+                if visual_rewrite_action_callback is not None:
+                    if num_block > 0:
+                        visual_rewrite_cache_generation += 1
+                    visual_rewrite_cache.clear()
+
                 # If a stop word is found and the stop word position is before the current block, do not process the current block
                 if found_stop_seq and stop_position <= block_start:
                     break
@@ -1775,6 +2019,142 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     current_block_masks = mask_index[0, block_start:block_end]
                     if not current_block_masks.any():
                         break
+
+                    visual_rewrite_context = None
+                    if visual_rewrite_action_callback is not None:
+                        requested_action = visual_rewrite_action_callback(
+                            step=global_step,
+                            block=num_block,
+                            block_step=i,
+                            multimodal_layout=copy.deepcopy(extended_layouts),
+                            metadata={
+                                "steps_per_block": steps,
+                                "prompt_length": inputs_embeds.shape[1],
+                                "gen_length": gen_length,
+                                "block_length": block_length,
+                                "suffix_length": suffix_len,
+                                "cache_generation": visual_rewrite_cache_generation,
+                            },
+                        )
+                        if requested_action not in {"refresh", "reuse"}:
+                            raise ValueError(
+                                "Visual Rewrite action must be 'refresh' or 'reuse'"
+                            )
+                        fallback_reason = None
+                        expected_metadata = {
+                            "generation": visual_rewrite_generation,
+                            "block": num_block,
+                            "layout_signature": visual_layout_signature,
+                            "batch": int(x_embeds.shape[0]),
+                            "sequence_length": int(x_embeds.shape[1]),
+                            "hidden_size": int(x_embeds.shape[2]),
+                            "dtype": str(x_embeds.dtype),
+                            "device": str(x_embeds.device),
+                            "cache_generation": visual_rewrite_cache_generation,
+                        }
+                        layer_count = len(self.model.layers)
+                        if requested_action == "reuse":
+                            if global_step == 0:
+                                fallback_reason = "first_step"
+                            elif i == 0:
+                                fallback_reason = "block_boundary"
+                            elif len(visual_rewrite_cache) != layer_count:
+                                fallback_reason = "cache_missing"
+                            else:
+                                for layer_index in range(layer_count):
+                                    entry = visual_rewrite_cache.get(layer_index)
+                                    if entry is None:
+                                        fallback_reason = "cache_missing"
+                                        break
+                                    cached_metadata = entry.get("metadata") or {}
+                                    metadata_guards = (
+                                        ("generation", "generation_mismatch"),
+                                        ("block", "block_mismatch"),
+                                        ("layout_signature", "layout_mismatch"),
+                                        ("batch", "batch_mismatch"),
+                                        ("sequence_length", "cache_shape_mismatch"),
+                                        ("hidden_size", "cache_shape_mismatch"),
+                                        ("dtype", "cache_dtype_mismatch"),
+                                        ("device", "cache_device_mismatch"),
+                                        (
+                                            "cache_generation",
+                                            "cache_generation_mismatch",
+                                        ),
+                                    )
+                                    for field, reason in metadata_guards:
+                                        if cached_metadata.get(field) != expected_metadata[field]:
+                                            fallback_reason = reason
+                                            break
+                                    if fallback_reason is not None:
+                                        break
+                                    visual_output = entry.get("visual_output")
+                                    visual_key = entry.get("visual_key")
+                                    visual_value = entry.get("visual_value")
+                                    attention = self.model.layers[
+                                        layer_index
+                                    ].self_attn
+                                    expected_visual_output_shape = (
+                                        1,
+                                        int(visual_indices.numel()),
+                                        int(x_embeds.shape[2]),
+                                    )
+                                    expected_visual_kv_shape = (
+                                        1,
+                                        int(attention.num_key_value_heads),
+                                        int(visual_indices.numel()),
+                                        int(attention.head_dim),
+                                    )
+                                    if (
+                                        visual_output is None
+                                        or visual_key is None
+                                        or visual_value is None
+                                        or tuple(visual_output.shape)
+                                        != expected_visual_output_shape
+                                        or tuple(visual_key.shape)
+                                        != expected_visual_kv_shape
+                                        or tuple(visual_value.shape)
+                                        != expected_visual_kv_shape
+                                    ):
+                                        fallback_reason = "cache_shape_mismatch"
+                                        break
+                                    if (
+                                        visual_output.dtype != x_embeds.dtype
+                                        or visual_key.dtype != x_embeds.dtype
+                                        or visual_value.dtype != x_embeds.dtype
+                                    ):
+                                        fallback_reason = "cache_dtype_mismatch"
+                                        break
+                                    if (
+                                        visual_output.device != x_embeds.device
+                                        or visual_key.device != x_embeds.device
+                                        or visual_value.device != x_embeds.device
+                                    ):
+                                        fallback_reason = "cache_device_mismatch"
+                                        break
+                        applied_action = (
+                            "refresh" if fallback_reason is not None else requested_action
+                        )
+                        if fallback_reason is not None:
+                            visual_rewrite_cache_generation += 1
+                            visual_rewrite_cache.clear()
+                            expected_metadata["cache_generation"] = (
+                                visual_rewrite_cache_generation
+                            )
+                        visual_rewrite_context = {
+                            "step": global_step,
+                            "block": num_block,
+                            "block_step": i,
+                            "requested_action": requested_action,
+                            "applied_action": applied_action,
+                            "fallback_reason": fallback_reason,
+                            "cache_generation": visual_rewrite_cache_generation,
+                            "cache_metadata": expected_metadata,
+                            "cache": visual_rewrite_cache,
+                            "pending_visual_kv": {},
+                            "visual_indices": visual_indices,
+                            "nonvisual_indices": nonvisual_indices,
+                            "audit": [],
+                        }
                     
                     # Handle CFG
                     intervention_mask = _intervention_attention_mask(
@@ -1838,6 +2218,10 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                                         ),
                                     )
                     model_kwargs = {}
+                    if visual_rewrite_context is not None:
+                        model_kwargs["visual_rewrite_context"] = (
+                            visual_rewrite_context
+                        )
                     requested_attention_layers = ()
                     if intervention_mask is not None:
                         model_kwargs["attention_mask"] = intervention_mask
@@ -1892,6 +2276,14 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         # Forward pass
                         outputs = self.model(inputs_embeds=x_embeds, **model_kwargs)
                         logits = self.lm_head(outputs[0]).float()
+
+                    if (
+                        visual_rewrite_context is not None
+                        and visual_rewrite_audit_callback is not None
+                    ):
+                        visual_rewrite_audit_callback(
+                            copy.deepcopy(visual_rewrite_context["audit"])
+                        )
                     
                     for token_id in [126081, 126080, 126346, 126347]:
                         logits[:, :, token_id] = torch.where(mask_index, -float('inf'), logits[:, :, token_id])
@@ -2199,6 +2591,11 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                                 ),
                                 "visual_mask_fallback_action": (
                                     visual_mask_fallback_action
+                                ),
+                                "visual_rewrite_actions": (
+                                    copy.deepcopy(visual_rewrite_context["audit"])
+                                    if visual_rewrite_context is not None
+                                    else []
                                 ),
                             },
                         )
