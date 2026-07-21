@@ -83,6 +83,27 @@ def _profiler_option(options, name, default=False):
     return getattr(options, name, default)
 
 
+def _phase31_layer_actions(actions, layer_count):
+    """Normalize the explicit Phase 3.1 layer-group callback contract."""
+    if not isinstance(actions, dict):
+        raise TypeError(
+            "Phase 3.1 layer-group callback must return a layer-to-action dict"
+        )
+    if any(not isinstance(layer, int) or isinstance(layer, bool) for layer in actions):
+        raise TypeError("Phase 3.1 layer-group keys must be integer layers")
+    normalized = dict(actions)
+    if set(normalized) != set(range(layer_count)):
+        raise ValueError("Phase 3.1 layer-group callback must cover every decoder layer")
+    invalid = {
+        layer: action
+        for layer, action in normalized.items()
+        if action not in {"refresh", "reuse"}
+    }
+    if invalid:
+        raise ValueError(f"invalid Phase 3.1 layer actions: {invalid}")
+    return normalized
+
+
 def _selected_layer_outputs(values, selected_layers, hidden_states=False):
     if values is None:
         return None
@@ -1104,10 +1125,14 @@ class LLaDADecoderLayer(nn.Module):
                 "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
             )
 
-        if visual_rewrite_context is not None and visual_rewrite_context[
-            "applied_action"
-        ] == "reuse":
-            cache_entry = visual_rewrite_context["cache"][self.self_attn.layer_idx]
+        layer_index = self.self_attn.layer_idx
+        layer_applied_action = (
+            visual_rewrite_context["applied_actions"][layer_index]
+            if visual_rewrite_context is not None
+            else None
+        )
+        if visual_rewrite_context is not None and layer_applied_action == "reuse":
+            cache_entry = visual_rewrite_context["cache"][layer_index]
             visual_indices = visual_rewrite_context["visual_indices"]
             nonvisual_indices = visual_rewrite_context["nonvisual_indices"]
             residual_nonvisual = hidden_states.index_select(1, nonvisual_indices)
@@ -1140,10 +1165,18 @@ class LLaDADecoderLayer(nn.Module):
                     "step": visual_rewrite_context["step"],
                     "block": visual_rewrite_context["block"],
                     "block_step": visual_rewrite_context["block_step"],
-                    "layer": self.self_attn.layer_idx,
-                    "requested_action": visual_rewrite_context["requested_action"],
+                    "layer": layer_index,
+                    "backend_lane": visual_rewrite_context["backend_lane"],
+                    "action_granularity": visual_rewrite_context[
+                        "action_granularity"
+                    ],
+                    "requested_action": visual_rewrite_context[
+                        "requested_actions"
+                    ][layer_index],
                     "applied_action": "reuse",
-                    "fallback_reason": None,
+                    "fallback_reason": visual_rewrite_context[
+                        "fallback_reasons"
+                    ][layer_index],
                     "cache_generation": visual_rewrite_context["cache_generation"],
                     "visual_query_projected": False,
                     "visual_mlp_executed": False,
@@ -1182,7 +1215,6 @@ class LLaDADecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         if visual_rewrite_context is not None:
-            layer_index = self.self_attn.layer_idx
             visual_indices = visual_rewrite_context["visual_indices"]
             pending = visual_rewrite_context["pending_visual_kv"].pop(layer_index)
             visual_rewrite_context["cache"][layer_index] = {
@@ -1199,9 +1231,17 @@ class LLaDADecoderLayer(nn.Module):
                     "block": visual_rewrite_context["block"],
                     "block_step": visual_rewrite_context["block_step"],
                     "layer": layer_index,
-                    "requested_action": visual_rewrite_context["requested_action"],
+                    "backend_lane": visual_rewrite_context["backend_lane"],
+                    "action_granularity": visual_rewrite_context[
+                        "action_granularity"
+                    ],
+                    "requested_action": visual_rewrite_context[
+                        "requested_actions"
+                    ][layer_index],
                     "applied_action": "refresh",
-                    "fallback_reason": visual_rewrite_context["fallback_reason"],
+                    "fallback_reason": visual_rewrite_context[
+                        "fallback_reasons"
+                    ][layer_index],
                     "cache_generation": visual_rewrite_context["cache_generation"],
                     "visual_query_projected": True,
                     "visual_mlp_executed": True,
@@ -1791,6 +1831,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         visual_mask_policy_step=None,
         visual_mask_policy_layer=None,
         visual_rewrite_action_callback=None,
+        visual_rewrite_group_action_callback=None,
         visual_rewrite_audit_callback=None,
         **kwargs,
     ):
@@ -1870,15 +1911,26 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     raise ValueError(
                         "visual_mask_policy_layer must identify an existing layer"
                     )
-            if visual_rewrite_action_callback is not None:
+            if (
+                visual_rewrite_action_callback is not None
+                and visual_rewrite_group_action_callback is not None
+            ):
+                raise ValueError(
+                    "step-global and layer-group Visual Rewrite callbacks are mutually exclusive"
+                )
+            visual_rewrite_enabled = (
+                visual_rewrite_action_callback is not None
+                or visual_rewrite_group_action_callback is not None
+            )
+            if visual_rewrite_enabled:
                 if cfg_scale != 0.0:
-                    raise ValueError("Visual Rewrite Phase 3.0 requires cfg_scale=0")
+                    raise ValueError("Visual Rewrite requires cfg_scale=0")
                 if inputs_embeds.shape[0] != 1:
-                    raise ValueError("Visual Rewrite Phase 3.0 requires batch size 1")
+                    raise ValueError("Visual Rewrite requires batch size 1")
                 if getattr(self.config, "_attn_implementation", None) != "eager":
-                    raise ValueError("Visual Rewrite Phase 3.0 requires eager attention")
+                    raise ValueError("Visual Rewrite requires eager attention")
                 if int(getattr(self.config, "pretraining_tp", 1)) != 1:
-                    raise ValueError("Visual Rewrite Phase 3.0 requires pretraining_tp=1")
+                    raise ValueError("Visual Rewrite requires pretraining_tp=1")
             extended_layouts = _extend_multimodal_layouts(
                 multimodal_layout,
                 inputs_embeds.shape[1],
@@ -1918,7 +1970,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             nonvisual_indices = None
             visual_layout_signature = None
             visual_rewrite_generation = f"generation-{id(x_embeds)}"
-            if visual_rewrite_action_callback is not None:
+            if visual_rewrite_enabled:
                 if not extended_layouts or len(extended_layouts) != 1:
                     raise ValueError(
                         "Visual Rewrite requires exactly one multimodal layout"
@@ -1989,7 +2041,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                 block_start = inputs_embeds.shape[1] + num_block * block_length
                 block_end = inputs_embeds.shape[1] + (num_block + 1) * block_length
 
-                if visual_rewrite_action_callback is not None:
+                if visual_rewrite_enabled:
                     if num_block > 0:
                         visual_rewrite_cache_generation += 1
                     visual_rewrite_cache.clear()
@@ -2021,13 +2073,13 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         break
 
                     visual_rewrite_context = None
-                    if visual_rewrite_action_callback is not None:
-                        requested_action = visual_rewrite_action_callback(
-                            step=global_step,
-                            block=num_block,
-                            block_step=i,
-                            multimodal_layout=copy.deepcopy(extended_layouts),
-                            metadata={
+                    if visual_rewrite_enabled:
+                        callback_kwargs = {
+                            "step": global_step,
+                            "block": num_block,
+                            "block_step": i,
+                            "multimodal_layout": copy.deepcopy(extended_layouts),
+                            "metadata": {
                                 "steps_per_block": steps,
                                 "prompt_length": inputs_embeds.shape[1],
                                 "gen_length": gen_length,
@@ -2035,11 +2087,33 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                                 "suffix_length": suffix_len,
                                 "cache_generation": visual_rewrite_cache_generation,
                             },
-                        )
-                        if requested_action not in {"refresh", "reuse"}:
-                            raise ValueError(
-                                "Visual Rewrite action must be 'refresh' or 'reuse'"
+                        }
+                        layer_count = len(self.model.layers)
+                        if visual_rewrite_group_action_callback is not None:
+                            if layer_count != 32:
+                                raise ValueError(
+                                    "Phase 3.1 layer-group lane requires exactly 32 layers"
+                                )
+                            requested_actions = _phase31_layer_actions(
+                                visual_rewrite_group_action_callback(**callback_kwargs),
+                                layer_count,
                             )
+                            backend_lane = "layer_group"
+                            action_granularity = "four_groups"
+                        else:
+                            requested_action = visual_rewrite_action_callback(
+                                **callback_kwargs
+                            )
+                            if requested_action not in {"refresh", "reuse"}:
+                                raise ValueError(
+                                    "Visual Rewrite action must be 'refresh' or 'reuse'"
+                                )
+                            requested_actions = {
+                                layer_index: requested_action
+                                for layer_index in range(layer_count)
+                            }
+                            backend_lane = "step_global"
+                            action_granularity = "all_layers"
                         fallback_reason = None
                         expected_metadata = {
                             "generation": visual_rewrite_generation,
@@ -2052,8 +2126,12 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                             "device": str(x_embeds.device),
                             "cache_generation": visual_rewrite_cache_generation,
                         }
-                        layer_count = len(self.model.layers)
-                        if requested_action == "reuse":
+                        reuse_layers = [
+                            layer_index
+                            for layer_index, action in requested_actions.items()
+                            if action == "reuse"
+                        ]
+                        if reuse_layers:
                             if global_step == 0:
                                 fallback_reason = "first_step"
                             elif i == 0:
@@ -2061,7 +2139,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                             elif len(visual_rewrite_cache) != layer_count:
                                 fallback_reason = "cache_missing"
                             else:
-                                for layer_index in range(layer_count):
+                                for layer_index in reuse_layers:
                                     entry = visual_rewrite_cache.get(layer_index)
                                     if entry is None:
                                         fallback_reason = "cache_missing"
@@ -2131,15 +2209,36 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                                     ):
                                         fallback_reason = "cache_device_mismatch"
                                         break
-                        applied_action = (
-                            "refresh" if fallback_reason is not None else requested_action
-                        )
                         if fallback_reason is not None:
                             visual_rewrite_cache_generation += 1
                             visual_rewrite_cache.clear()
                             expected_metadata["cache_generation"] = (
                                 visual_rewrite_cache_generation
                             )
+                            applied_actions = {
+                                layer_index: "refresh"
+                                for layer_index in range(layer_count)
+                            }
+                            fallback_reasons = {
+                                layer_index: fallback_reason
+                                for layer_index in range(layer_count)
+                            }
+                        else:
+                            applied_actions = dict(requested_actions)
+                            fallback_reasons = {
+                                layer_index: None
+                                for layer_index in range(layer_count)
+                            }
+                        requested_action = (
+                            next(iter(set(requested_actions.values())))
+                            if len(set(requested_actions.values())) == 1
+                            else "mixed"
+                        )
+                        applied_action = (
+                            next(iter(set(applied_actions.values())))
+                            if len(set(applied_actions.values())) == 1
+                            else "mixed"
+                        )
                         visual_rewrite_context = {
                             "step": global_step,
                             "block": num_block,
@@ -2147,6 +2246,11 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                             "requested_action": requested_action,
                             "applied_action": applied_action,
                             "fallback_reason": fallback_reason,
+                            "requested_actions": requested_actions,
+                            "applied_actions": applied_actions,
+                            "fallback_reasons": fallback_reasons,
+                            "backend_lane": backend_lane,
+                            "action_granularity": action_granularity,
                             "cache_generation": visual_rewrite_cache_generation,
                             "cache_metadata": expected_metadata,
                             "cache": visual_rewrite_cache,
