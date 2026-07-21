@@ -104,6 +104,20 @@ def _phase31_layer_actions(actions, layer_count):
     return normalized
 
 
+def _phase31_visual_rewrite_forward_kwargs(visual_rewrite_context):
+    """Build forward kwargs without enabling the unsupported MDM KV cache."""
+    if visual_rewrite_context is None:
+        return {}
+    return {
+        "visual_rewrite_context": visual_rewrite_context,
+        # LLaDA denoising recomputes the complete sequence at every step.  The
+        # model explicitly does not support a generation KV cache, and a
+        # DynamicCache cannot remain layer-index aligned when layer-group
+        # reuse skips decoder layers.
+        "use_cache": False,
+    }
+
+
 def _selected_layer_outputs(values, selected_layers, hidden_states=False):
     if values is None:
         return None
@@ -2321,11 +2335,9 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                                             observation_applied_visual_key_count
                                         ),
                                     )
-                    model_kwargs = {}
-                    if visual_rewrite_context is not None:
-                        model_kwargs["visual_rewrite_context"] = (
-                            visual_rewrite_context
-                        )
+                    model_kwargs = _phase31_visual_rewrite_forward_kwargs(
+                        visual_rewrite_context
+                    )
                     requested_attention_layers = ()
                     if intervention_mask is not None:
                         model_kwargs["attention_mask"] = intervention_mask
