@@ -1890,6 +1890,15 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             capture_attentions = profiler_enabled and _profiler_option(
                 profiler_options, "capture_attentions", False
             )
+            capture_probes_at_steps_only = profiler_enabled and _profiler_option(
+                profiler_options, "capture_probes_at_steps_only", False
+            )
+            profiler_capture_steps = frozenset(
+                int(step)
+                for step in _profiler_option(
+                    profiler_options, "capture_steps", ()
+                )
+            )
             selected_layers = tuple(
                 _profiler_option(profiler_options, "selected_layers", ())
             )
@@ -2344,7 +2353,11 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     if capture_hidden_states:
                         model_kwargs["output_hidden_states"] = True
                         model_kwargs["return_dict"] = True
-                    if capture_attentions:
+                    capture_attentions_this_step = capture_attentions and (
+                        not capture_probes_at_steps_only
+                        or global_step in profiler_capture_steps
+                    )
+                    if capture_attentions_this_step:
                         model_kwargs["output_attentions"] = True
                         model_kwargs["return_dict"] = True
                         requested_attention_layers = selected_layers
