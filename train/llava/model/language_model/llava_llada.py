@@ -149,6 +149,9 @@ class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
         visual_rewrite_group_action_callback = kwargs.get(
             "visual_rewrite_group_action_callback"
         )
+        qk_causal_intervention_callback = kwargs.get(
+            "qk_causal_intervention_callback"
+        )
         need_multimodal_layout = (
             profiler_callback is not None
             or profiler_options is not None
@@ -157,6 +160,7 @@ class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
             or visual_mask_policy_callback is not None
             or visual_rewrite_action_callback is not None
             or visual_rewrite_group_action_callback is not None
+            or qk_causal_intervention_callback is not None
         )
 
         if images is not None:

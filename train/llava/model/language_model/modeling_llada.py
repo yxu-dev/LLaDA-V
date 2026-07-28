@@ -664,6 +664,17 @@ class LLaDAAttention(nn.Module):
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
+        qk_causal_intervention_context = kwargs.get(
+            "qk_causal_intervention_context"
+        )
+        if qk_causal_intervention_context is not None:
+            query_states = qk_causal_intervention_context.before_attention(
+                layer=self.layer_idx,
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+            )
+
         visual_rewrite_context = kwargs.get("visual_rewrite_context")
         if visual_rewrite_context is not None:
             visual_indices = visual_rewrite_context["visual_indices"]
@@ -683,6 +694,13 @@ class LLaDAAttention(nn.Module):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if qk_causal_intervention_context is not None:
+            attn_weights = qk_causal_intervention_context.after_logits(
+                layer=self.layer_idx,
+                attention_logits=attn_weights,
+                query_states=query_states,
+                key_states=key_states,
+            )
 
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
@@ -691,7 +709,19 @@ class LLaDAAttention(nn.Module):
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        if qk_causal_intervention_context is not None:
+            qk_causal_intervention_context.observe_attention(
+                layer=self.layer_idx,
+                attention_weights=attn_weights,
+            )
         attn_output = torch.matmul(attn_weights, value_states)
+        if qk_causal_intervention_context is not None:
+            attn_output = qk_causal_intervention_context.after_output(
+                layer=self.layer_idx,
+                attention_output=attn_output,
+                attention_weights=attn_weights,
+                value_states=value_states,
+            )
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -1118,6 +1148,7 @@ class LLaDADecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         visual_rewrite_context=None,
+        qk_causal_intervention_context=None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -1218,6 +1249,7 @@ class LLaDADecoderLayer(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
             visual_rewrite_context=visual_rewrite_context,
+            qk_causal_intervention_context=qk_causal_intervention_context,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -1227,6 +1259,12 @@ class LLaDADecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+
+        if qk_causal_intervention_context is not None:
+            qk_causal_intervention_context.observe_hidden(
+                layer=layer_index,
+                hidden_states=hidden_states,
+            )
 
         if visual_rewrite_context is not None:
             visual_indices = visual_rewrite_context["visual_indices"]
@@ -1847,6 +1885,9 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         visual_rewrite_action_callback=None,
         visual_rewrite_group_action_callback=None,
         visual_rewrite_audit_callback=None,
+        visual_rewrite_allow_cross_block_reuse=False,
+        qk_causal_intervention_callback=None,
+        stop_after_step=None,
         **kwargs,
     ):
         '''
@@ -1883,6 +1924,9 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             )
             capture_logits = profiler_enabled and _profiler_option(
                 profiler_options, "capture_logits", True
+            )
+            capture_exact_entropy = profiler_enabled and _profiler_option(
+                profiler_options, "capture_exact_entropy", False
             )
             capture_hidden_states = profiler_enabled and _profiler_option(
                 profiler_options, "capture_hidden_states", False
@@ -1945,6 +1989,11 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                 visual_rewrite_action_callback is not None
                 or visual_rewrite_group_action_callback is not None
             )
+            if stop_after_step is not None and (
+                not isinstance(stop_after_step, int)
+                or not 0 <= stop_after_step < steps
+            ):
+                raise ValueError("stop_after_step must be a valid global step")
             if visual_rewrite_enabled:
                 if cfg_scale != 0.0:
                     raise ValueError("Visual Rewrite requires cfg_scale=0")
@@ -1954,6 +2003,22 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     raise ValueError("Visual Rewrite requires eager attention")
                 if int(getattr(self.config, "pretraining_tp", 1)) != 1:
                     raise ValueError("Visual Rewrite requires pretraining_tp=1")
+            elif visual_rewrite_allow_cross_block_reuse:
+                raise ValueError(
+                    "cross-block reuse requires a Visual Rewrite callback"
+                )
+            if qk_causal_intervention_callback is not None:
+                if visual_rewrite_enabled or visual_mask_policy_callback is not None:
+                    raise ValueError(
+                        "Q/K causal intervention cannot be combined with visual "
+                        "rewrite or dynamic visual masking"
+                    )
+                if cfg_scale != 0.0 or inputs_embeds.shape[0] != 1:
+                    raise ValueError(
+                        "Q/K causal intervention requires cfg_scale=0 and batch size 1"
+                    )
+                if getattr(self.config, "_attn_implementation", None) != "eager":
+                    raise ValueError("Q/K causal intervention requires eager attention")
             extended_layouts = _extend_multimodal_layouts(
                 multimodal_layout,
                 inputs_embeds.shape[1],
@@ -2059,15 +2124,16 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             visual_mask_proposal_event_recorded = False
             visual_mask_fallback_action = None
             visual_mask_participation_proxy = 0.0
+            requested_early_stop = False
             for num_block in range(num_blocks):
                 # Create mask index for the current block
                 block_start = inputs_embeds.shape[1] + num_block * block_length
                 block_end = inputs_embeds.shape[1] + (num_block + 1) * block_length
 
                 if visual_rewrite_enabled:
-                    if num_block > 0:
+                    if num_block > 0 and not visual_rewrite_allow_cross_block_reuse:
                         visual_rewrite_cache_generation += 1
-                    visual_rewrite_cache.clear()
+                        visual_rewrite_cache.clear()
 
                 # If a stop word is found and the stop word position is before the current block, do not process the current block
                 if found_stop_seq and stop_position <= block_start:
@@ -2140,7 +2206,11 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         fallback_reason = None
                         expected_metadata = {
                             "generation": visual_rewrite_generation,
-                            "block": num_block,
+                            "block": (
+                                "cross_block"
+                                if visual_rewrite_allow_cross_block_reuse
+                                else num_block
+                            ),
                             "layout_signature": visual_layout_signature,
                             "batch": int(x_embeds.shape[0]),
                             "sequence_length": int(x_embeds.shape[1]),
@@ -2157,7 +2227,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         if reuse_layers:
                             if global_step == 0:
                                 fallback_reason = "first_step"
-                            elif i == 0:
+                            elif i == 0 and not visual_rewrite_allow_cross_block_reuse:
                                 fallback_reason = "block_boundary"
                             elif len(visual_rewrite_cache) != layer_count:
                                 fallback_reason = "cache_missing"
@@ -2282,6 +2352,25 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                             "nonvisual_indices": nonvisual_indices,
                             "audit": [],
                         }
+
+                    qk_causal_intervention_context = None
+                    if qk_causal_intervention_callback is not None:
+                        qk_causal_intervention_context = (
+                            qk_causal_intervention_callback.begin_step(
+                                step=global_step,
+                                block=num_block,
+                                block_step=i,
+                                mask_state_before=mask_index.detach().clone(),
+                                multimodal_layout=copy.deepcopy(extended_layouts),
+                                metadata={
+                                    "steps_per_block": steps,
+                                    "prompt_length": inputs_embeds.shape[1],
+                                    "gen_length": gen_length,
+                                    "block_length": block_length,
+                                    "suffix_length": suffix_len,
+                                },
+                            )
+                        )
                     
                     # Handle CFG
                     intervention_mask = _intervention_attention_mask(
@@ -2347,6 +2436,10 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     model_kwargs = _phase31_visual_rewrite_forward_kwargs(
                         visual_rewrite_context
                     )
+                    if qk_causal_intervention_context is not None:
+                        model_kwargs["qk_causal_intervention_context"] = (
+                            qk_causal_intervention_context
+                        )
                     requested_attention_layers = ()
                     if intervention_mask is not None:
                         model_kwargs["attention_mask"] = intervention_mask
@@ -2416,6 +2509,34 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     
                     for token_id in [126081, 126080, 126346, 126347]:
                         logits[:, :, token_id] = torch.where(mask_index, -float('inf'), logits[:, :, token_id])
+
+                    exact_entropy = None
+                    if capture_exact_entropy:
+                        exact_entropy = torch.full(
+                            mask_index.shape,
+                            float("nan"),
+                            dtype=torch.float32,
+                            device=logits.device,
+                        )
+                        active_logits = logits[mask_index].float()
+                        if active_logits.numel():
+                            active_log_normalizer = torch.logsumexp(
+                                active_logits, dim=-1
+                            )
+                            active_probabilities = torch.softmax(
+                                active_logits, dim=-1, dtype=torch.float32
+                            )
+                            probability_weighted_logits = torch.where(
+                                torch.isfinite(active_logits),
+                                active_probabilities * active_logits,
+                                torch.zeros_like(active_logits),
+                            )
+                            exact_entropy[mask_index] = (
+                                active_log_normalizer
+                                - probability_weighted_logits.sum(dim=-1)
+                            )
+                    if qk_causal_intervention_context is not None:
+                        qk_causal_intervention_context.observe_logits(logits=logits)
                     
                     # Add noise and get the most likely token
                     logits_with_noise = self.add_gumbel_noise(logits, temperature=temperature) # shape (1, l + gen_length + suffix_len, vocab_size)
@@ -2662,6 +2783,11 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                             input_ids_before=input_ids_before,
                             input_ids_after=x.detach().clone(),
                             logits=logits.detach() if capture_logits else None,
+                            exact_entropy=(
+                                exact_entropy.detach()
+                                if exact_entropy is not None
+                                else None
+                            ),
                             hidden_states=hidden_states,
                             attentions=attentions,
                             past_key_values=getattr(outputs, "past_key_values", None),
@@ -2729,6 +2855,12 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                             },
                         )
 
+                    if qk_causal_intervention_context is not None:
+                        qk_causal_intervention_context.end_step()
+                    if stop_after_step is not None and global_step == stop_after_step:
+                        requested_early_stop = True
+                        break
+
                     # New: Check for stop words after each update
                     if stopping_criteria is not None:
                         # Only check the generated part (excluding the suffix)
@@ -2750,6 +2882,9 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                                     break
                             if found_stop_seq and current_stop_position is None:
                                 break
+
+                if requested_early_stop:
+                    break
 
             # Return the generated result, up to stop_position, and append the suffix
             if found_stop_seq:
