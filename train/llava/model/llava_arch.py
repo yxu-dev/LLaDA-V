@@ -74,6 +74,9 @@ def _build_multimodal_layout(
 ):
     if visual_spans is None:
         visual_spans = _contiguous_spans(token_types, "visual")
+    visual_positions = [
+        index for start, end in visual_spans for index in range(start, end)
+    ]
     return {
         "sequence_length": len(token_types),
         "prompt_text_spans": _contiguous_spans(token_types, "prompt_text"),
@@ -82,6 +85,23 @@ def _build_multimodal_layout(
         "suffix_span": None,
         "image_grid_shapes": image_grid_shapes,
         "token_types": token_types,
+        "visual_positions": visual_positions,
+        "prompt_positions": [
+            index
+            for index, token_type in enumerate(token_types)
+            if token_type == "prompt_text"
+        ],
+        "response_positions": [],
+        "special_positions": [
+            index
+            for index, token_type in enumerate(token_types)
+            if token_type in {"special", "suffix"}
+        ],
+        "padding_positions": [
+            index
+            for index, token_type in enumerate(token_types)
+            if token_type == "padding"
+        ],
         "padding_side": padding_side,
         "metadata": {
             "grid_shape_kind": "exact_if_square_otherwise_flattened",

@@ -152,6 +152,9 @@ class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
         qk_causal_intervention_callback = kwargs.get(
             "qk_causal_intervention_callback"
         )
+        context_feedback_intervention_callback = kwargs.get(
+            "context_feedback_intervention_callback"
+        )
         need_multimodal_layout = (
             profiler_callback is not None
             or profiler_options is not None
@@ -161,6 +164,7 @@ class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
             or visual_rewrite_action_callback is not None
             or visual_rewrite_group_action_callback is not None
             or qk_causal_intervention_callback is not None
+            or context_feedback_intervention_callback is not None
         )
 
         if images is not None:
@@ -208,6 +212,11 @@ class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
                         "suffix_span": None,
                         "image_grid_shapes": [],
                         "token_types": ["prompt_text"] * sequence_length,
+                        "visual_positions": [],
+                        "prompt_positions": list(range(sequence_length)),
+                        "response_positions": [],
+                        "special_positions": [],
+                        "padding_positions": [],
                         "padding_side": getattr(
                             self.config, "tokenizer_padding_side", "right"
                         ),

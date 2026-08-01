@@ -292,6 +292,11 @@ def _extend_multimodal_layouts(layouts, prompt_length, gen_length, suffix_length
                 "suffix_span": None,
                 "image_grid_shapes": [],
                 "token_types": ["prompt_text"] * prompt_length,
+                "visual_positions": [],
+                "prompt_positions": list(range(prompt_length)),
+                "response_positions": [],
+                "special_positions": [],
+                "padding_positions": [],
                 "padding_side": "right",
                 "metadata": {},
             }
@@ -318,6 +323,27 @@ def _extend_multimodal_layouts(layouts, prompt_length, gen_length, suffix_length
                 "generated_span": generated_span,
                 "suffix_span": suffix_span,
                 "token_types": token_types,
+                "visual_positions": [
+                    index
+                    for start, end in current.get("visual_spans", [])
+                    for index in range(start, end)
+                ],
+                "prompt_positions": [
+                    index
+                    for index, token_type in enumerate(token_types)
+                    if token_type == "prompt_text"
+                ],
+                "response_positions": list(range(*generated_span)),
+                "special_positions": [
+                    index
+                    for index, token_type in enumerate(token_types)
+                    if token_type in {"special", "suffix"}
+                ],
+                "padding_positions": [
+                    index
+                    for index, token_type in enumerate(token_types)
+                    if token_type == "padding"
+                ],
             }
         )
         extended.append(current)
@@ -667,6 +693,9 @@ class LLaDAAttention(nn.Module):
         qk_causal_intervention_context = kwargs.get(
             "qk_causal_intervention_context"
         )
+        context_feedback_intervention_context = kwargs.get(
+            "context_feedback_intervention_context"
+        )
         if qk_causal_intervention_context is not None:
             query_states = qk_causal_intervention_context.before_attention(
                 layer=self.layer_idx,
@@ -706,8 +735,22 @@ class LLaDAAttention(nn.Module):
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        # Task 10 operates on the probability distribution after the model mask,
+        # while it is still FP32 and before dtype cast, dropout, and A @ V.
+        attn_weights = nn.functional.softmax(
+            attn_weights, dim=-1, dtype=torch.float32
+        )
+        if context_feedback_intervention_context is not None:
+            attn_weights = context_feedback_intervention_context.after_softmax(
+                layer=self.layer_idx,
+                attention_weights=attn_weights,
+                attention_mask=(
+                    causal_mask if attention_mask is not None else None
+                ),
+                key_states=key_states,
+                value_states=value_states,
+            )
+        attn_weights = attn_weights.to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         if qk_causal_intervention_context is not None:
             qk_causal_intervention_context.observe_attention(
@@ -1149,6 +1192,7 @@ class LLaDADecoderLayer(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         visual_rewrite_context=None,
         qk_causal_intervention_context=None,
+        context_feedback_intervention_context=None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -1250,15 +1294,34 @@ class LLaDADecoderLayer(nn.Module):
             cache_position=cache_position,
             visual_rewrite_context=visual_rewrite_context,
             qk_causal_intervention_context=qk_causal_intervention_context,
+            context_feedback_intervention_context=(
+                context_feedback_intervention_context
+            ),
             **kwargs,
         )
+        if context_feedback_intervention_context is not None:
+            hidden_states = context_feedback_intervention_context.after_attention_branch(
+                layer=layer_index,
+                attention_output=hidden_states,
+            )
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if context_feedback_intervention_context is not None:
+            hidden_states = context_feedback_intervention_context.after_mlp_branch(
+                layer=layer_index,
+                mlp_output=hidden_states,
+            )
         hidden_states = residual + hidden_states
+
+        if context_feedback_intervention_context is not None:
+            context_feedback_intervention_context.observe_hidden(
+                layer=layer_index,
+                hidden_states=hidden_states,
+            )
 
         if qk_causal_intervention_context is not None:
             qk_causal_intervention_context.observe_hidden(
@@ -1887,6 +1950,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         visual_rewrite_audit_callback=None,
         visual_rewrite_allow_cross_block_reuse=False,
         qk_causal_intervention_callback=None,
+        context_feedback_intervention_callback=None,
         stop_after_step=None,
         **kwargs,
     ):
@@ -2019,6 +2083,22 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     )
                 if getattr(self.config, "_attn_implementation", None) != "eager":
                     raise ValueError("Q/K causal intervention requires eager attention")
+            if context_feedback_intervention_callback is not None:
+                if (
+                    visual_rewrite_enabled
+                    or visual_mask_policy_callback is not None
+                    or qk_causal_intervention_callback is not None
+                ):
+                    raise ValueError(
+                        "Task 10 context feedback cannot be combined with visual "
+                        "rewrite, dynamic visual masking, or Task 7 Q/K intervention"
+                    )
+                if cfg_scale != 0.0 or inputs_embeds.shape[0] != 1:
+                    raise ValueError(
+                        "Task 10 context feedback requires cfg_scale=0 and batch size 1"
+                    )
+                if getattr(self.config, "_attn_implementation", None) != "eager":
+                    raise ValueError("Task 10 context feedback requires eager attention")
             extended_layouts = _extend_multimodal_layouts(
                 multimodal_layout,
                 inputs_embeds.shape[1],
@@ -2371,6 +2451,25 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                                 },
                             )
                         )
+
+                    context_feedback_intervention_context = None
+                    if context_feedback_intervention_callback is not None:
+                        context_feedback_intervention_context = (
+                            context_feedback_intervention_callback.begin_step(
+                                step=global_step,
+                                block=num_block,
+                                block_step=i,
+                                mask_state_before=mask_index.detach().clone(),
+                                multimodal_layout=copy.deepcopy(extended_layouts),
+                                metadata={
+                                    "steps_per_block": steps,
+                                    "prompt_length": inputs_embeds.shape[1],
+                                    "gen_length": gen_length,
+                                    "block_length": block_length,
+                                    "suffix_length": suffix_len,
+                                },
+                            )
+                        )
                     
                     # Handle CFG
                     intervention_mask = _intervention_attention_mask(
@@ -2439,6 +2538,10 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     if qk_causal_intervention_context is not None:
                         model_kwargs["qk_causal_intervention_context"] = (
                             qk_causal_intervention_context
+                        )
+                    if context_feedback_intervention_context is not None:
+                        model_kwargs["context_feedback_intervention_context"] = (
+                            context_feedback_intervention_context
                         )
                     requested_attention_layers = ()
                     if intervention_mask is not None:
@@ -2537,6 +2640,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                             )
                     if qk_causal_intervention_context is not None:
                         qk_causal_intervention_context.observe_logits(logits=logits)
+                    if context_feedback_intervention_context is not None:
+                        context_feedback_intervention_context.observe_logits(logits=logits)
                     
                     # Add noise and get the most likely token
                     logits_with_noise = self.add_gumbel_noise(logits, temperature=temperature) # shape (1, l + gen_length + suffix_len, vocab_size)
@@ -2857,6 +2962,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
 
                     if qk_causal_intervention_context is not None:
                         qk_causal_intervention_context.end_step()
+                    if context_feedback_intervention_context is not None:
+                        context_feedback_intervention_context.end_step()
                     if stop_after_step is not None and global_step == stop_after_step:
                         requested_early_stop = True
                         break
