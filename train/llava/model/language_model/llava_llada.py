@@ -165,6 +165,7 @@ class LlavaLLaDAModelLM(LLaDAModelLM, LlavaMetaForCausalLM):
             or visual_rewrite_group_action_callback is not None
             or qk_causal_intervention_callback is not None
             or context_feedback_intervention_callback is not None
+            or kwargs.get("elastic_cache_controller") is not None
         )
 
         if images is not None:

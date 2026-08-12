@@ -690,6 +690,17 @@ class LLaDAAttention(nn.Module):
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
+        elastic_cache_controller = kwargs.get("elastic_cache_controller")
+        if elastic_cache_controller is not None:
+            query_states, key_states, value_states = (
+                elastic_cache_controller.materialize_kv(
+                    layer=self.layer_idx,
+                    query=query_states,
+                    key=key_states,
+                    value=value_states,
+                )
+            )
+
         qk_causal_intervention_context = kwargs.get(
             "qk_causal_intervention_context"
         )
@@ -752,6 +763,11 @@ class LLaDAAttention(nn.Module):
             )
         attn_weights = attn_weights.to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        if elastic_cache_controller is not None:
+            elastic_cache_controller.observe_attention(
+                layer=self.layer_idx,
+                attention_weights=attn_weights,
+            )
         if qk_causal_intervention_context is not None:
             qk_causal_intervention_context.observe_attention(
                 layer=self.layer_idx,
@@ -1616,7 +1632,18 @@ class LLaDAModel(LLaDAPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, is_causal=False) # Modify: MDM
+        elastic_cache_controller = kwargs.get("elastic_cache_controller")
+        causal_mask = (
+            None
+            if (
+                elastic_cache_controller is not None
+                and elastic_cache_controller.uses_partial_query
+                and attention_mask is None
+            )
+            else self._update_causal_mask(
+                attention_mask, inputs_embeds, cache_position, is_causal=False
+            )
+        ) # Modify: MDM
 
         # embed positions
         hidden_states = inputs_embeds
@@ -1627,6 +1654,16 @@ class LLaDAModel(LLaDAPreTrainedModel):
         next_decoder_cache = None
 
         for layer_index, decoder_layer in enumerate(self.layers):
+            layer_position_ids = position_ids
+            if elastic_cache_controller is not None:
+                hidden_states = elastic_cache_controller.before_layer(
+                    layer=layer_index,
+                    hidden_states=hidden_states,
+                )
+                layer_position_ids = elastic_cache_controller.position_ids(
+                    layer=layer_index,
+                    device=hidden_states.device,
+                )
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1639,7 +1676,7 @@ class LLaDAModel(LLaDAPreTrainedModel):
                     decoder_layer.__call__,
                     hidden_states,
                     causal_mask,
-                    position_ids,
+                    layer_position_ids,
                     past_key_values,
                     layer_output_attentions,
                     use_cache,
@@ -1650,7 +1687,7 @@ class LLaDAModel(LLaDAPreTrainedModel):
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
-                    position_ids=position_ids,
+                    position_ids=layer_position_ids,
                     past_key_value=past_key_values,
                     output_attentions=layer_output_attentions,
                     use_cache=use_cache,
@@ -1951,6 +1988,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         visual_rewrite_allow_cross_block_reuse=False,
         qk_causal_intervention_callback=None,
         context_feedback_intervention_callback=None,
+        elastic_cache_controller=None,
         stop_after_step=None,
         **kwargs,
     ):
@@ -2099,6 +2137,23 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     )
                 if getattr(self.config, "_attn_implementation", None) != "eager":
                     raise ValueError("Task 10 context feedback requires eager attention")
+            if elastic_cache_controller is not None:
+                incompatible = (
+                    intervention is not None
+                    or transfer_policy_callback is not None
+                    or visual_mask_policy_callback is not None
+                    or visual_rewrite_enabled
+                    or qk_causal_intervention_callback is not None
+                    or context_feedback_intervention_callback is not None
+                )
+                if incompatible:
+                    raise ValueError(
+                        "Elastic cache cannot be combined with Stage 2/3 policies or interventions"
+                    )
+                if cfg_scale != 0.0 or inputs_embeds.shape[0] != 1:
+                    raise ValueError("Elastic cache requires cfg_scale=0 and batch size 1")
+                if getattr(self.config, "_attn_implementation", None) != "eager":
+                    raise ValueError("Elastic cache requires eager attention")
             extended_layouts = _extend_multimodal_layouts(
                 multimodal_layout,
                 inputs_embeds.shape[1],
@@ -2197,6 +2252,11 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
 
             feature_cache = dLLMCache()
             feature_cache.reset_cache(inputs_embeds.shape[1])
+            elastic_newly_decoded = torch.empty(
+                0, dtype=torch.long, device=x_embeds.device
+            )
+            if elastic_cache_controller is not None:
+                elastic_cache_controller.reset()
             selected_visual_keys = None
             visual_mask_activation_step = None
             visual_mask_proposal_id = None
@@ -2240,6 +2300,37 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     current_block_masks = mask_index[0, block_start:block_end]
                     if not current_block_masks.any():
                         break
+
+                    elastic_query_positions = None
+                    if elastic_cache_controller is not None:
+                        all_masked_positions = torch.nonzero(
+                            mask_index[0], as_tuple=False
+                        ).flatten()
+                        active_masked_positions = torch.nonzero(
+                            mask_index[0]
+                            & (
+                                torch.arange(total_length, device=x_embeds.device)
+                                >= block_start
+                            )
+                            & (
+                                torch.arange(total_length, device=x_embeds.device)
+                                < block_end
+                            ),
+                            as_tuple=False,
+                        ).flatten()
+                        elastic_query_positions = elastic_cache_controller.begin_step(
+                            step=global_step,
+                            block=num_block,
+                            sequence_length=total_length,
+                            masked_positions=all_masked_positions,
+                            active_masked_positions=active_masked_positions,
+                            newly_decoded_positions=elastic_newly_decoded,
+                            multimodal_layout=(
+                                copy.deepcopy(extended_layouts[0])
+                                if extended_layouts
+                                else None
+                            ),
+                        )
 
                     visual_rewrite_context = None
                     if visual_rewrite_enabled:
@@ -2535,6 +2626,10 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     model_kwargs = _phase31_visual_rewrite_forward_kwargs(
                         visual_rewrite_context
                     )
+                    if elastic_cache_controller is not None:
+                        model_kwargs["elastic_cache_controller"] = (
+                            elastic_cache_controller
+                        )
                     if qk_causal_intervention_context is not None:
                         model_kwargs["qk_causal_intervention_context"] = (
                             qk_causal_intervention_context
@@ -2599,8 +2694,19 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                     else:
                         # Forward pass
-                        outputs = self.model(inputs_embeds=x_embeds, **model_kwargs)
+                        forward_embeds = (
+                            x_embeds.index_select(1, elastic_query_positions)
+                            if elastic_query_positions is not None
+                            else x_embeds
+                        )
+                        outputs = self.model(
+                            inputs_embeds=forward_embeds, **model_kwargs
+                        )
                         logits = self.lm_head(outputs[0]).float()
+                        if elastic_cache_controller is not None:
+                            logits = elastic_cache_controller.restore_sequence(
+                                logits, fill_value=0.0
+                            )
 
                     if (
                         visual_rewrite_context is not None
@@ -2612,6 +2718,9 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     
                     for token_id in [126081, 126080, 126346, 126347]:
                         logits[:, :, token_id] = torch.where(mask_index, -float('inf'), logits[:, :, token_id])
+                    if elastic_cache_controller is not None:
+                        elastic_cache_controller.observe_logits(logits)
+                        elastic_cache_controller.end_step()
 
                     exact_entropy = None
                     if capture_exact_entropy:
@@ -2754,6 +2863,10 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     # Update embeddings and token IDs
                     x_embeds[transfer_index] = x0_embeds[transfer_index]
                     x[transfer_index] = x0[transfer_index]
+                    if elastic_cache_controller is not None:
+                        elastic_newly_decoded = torch.nonzero(
+                            transfer_index[0], as_tuple=False
+                        ).flatten()
 
                     if visual_policy_active:
                         all_attentions = getattr(outputs, "attentions", None)
