@@ -21,6 +21,7 @@
 
 import copy
 import math
+import time
 import warnings
 from typing import List, Optional, Tuple, Union
 import numpy as np
@@ -700,6 +701,16 @@ class LLaDAAttention(nn.Module):
                     value=value_states,
                 )
             )
+        shadow_fresh_auditor = kwargs.get("shadow_fresh_auditor")
+        if shadow_fresh_auditor is not None:
+            if kwargs.get("shadow_fresh_capture", False):
+                shadow_fresh_auditor.capture_fresh_key(
+                    layer=self.layer_idx, key_states=key_states
+                )
+            elif elastic_cache_controller is not None:
+                shadow_fresh_auditor.capture_primary_key(
+                    layer=self.layer_idx, key_states=key_states
+                )
 
         qk_causal_intervention_context = kwargs.get(
             "qk_causal_intervention_context"
@@ -1664,6 +1675,19 @@ class LLaDAModel(LLaDAPreTrainedModel):
                     layer=layer_index,
                     device=hidden_states.device,
                 )
+            shadow_fresh_auditor = kwargs.get("shadow_fresh_auditor")
+            if shadow_fresh_auditor is not None:
+                if kwargs.get("shadow_fresh_capture", False):
+                    shadow_fresh_auditor.capture_fresh_hidden(
+                        layer=layer_index, hidden_states=hidden_states
+                    )
+                elif elastic_cache_controller is not None:
+                    shadow_fresh_auditor.capture_primary_hidden(
+                        layer=layer_index,
+                        hidden_states=elastic_cache_controller.full_hidden_for_audit(
+                            layer=layer_index
+                        ),
+                    )
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1989,6 +2013,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         qk_causal_intervention_callback=None,
         context_feedback_intervention_callback=None,
         elastic_cache_controller=None,
+        shadow_fresh_auditor=None,
         stop_after_step=None,
         **kwargs,
     ):
@@ -2331,6 +2356,15 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                                 else None
                             ),
                         )
+                        if (
+                            shadow_fresh_auditor is not None
+                            and shadow_fresh_auditor.should_run(global_step)
+                        ):
+                            shadow_fresh_auditor.begin_step(
+                                step=global_step,
+                                layout=copy.deepcopy(extended_layouts[0]),
+                                query_positions=elastic_query_positions,
+                            )
 
                     visual_rewrite_context = None
                     if visual_rewrite_enabled:
@@ -2630,6 +2664,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         model_kwargs["elastic_cache_controller"] = (
                             elastic_cache_controller
                         )
+                    if shadow_fresh_auditor is not None:
+                        model_kwargs["shadow_fresh_auditor"] = shadow_fresh_auditor
                     if qk_causal_intervention_context is not None:
                         model_kwargs["qk_causal_intervention_context"] = (
                             qk_causal_intervention_context
@@ -2673,6 +2709,28 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         model_kwargs["output_attention_layers"] = (
                             requested_attention_layers
                         )
+                    shadow_compute_seconds = 0.0
+                    if (
+                        shadow_fresh_auditor is not None
+                        and shadow_fresh_auditor.should_run(global_step)
+                    ):
+                        if cfg_scale > 0.0:
+                            raise ValueError(
+                                "Task 2b shadow fresh audit requires cfg_scale=0"
+                            )
+                        shadow_started = time.perf_counter()
+                        rng_devices = (
+                            [x_embeds.device.index] if x_embeds.is_cuda else []
+                        )
+                        with torch.random.fork_rng(devices=rng_devices):
+                            fresh_outputs = self.model(
+                                inputs_embeds=x_embeds,
+                                shadow_fresh_auditor=shadow_fresh_auditor,
+                                shadow_fresh_capture=True,
+                            )
+                            fresh_logits = self.lm_head(fresh_outputs[0]).float()
+                        shadow_compute_seconds = time.perf_counter() - shadow_started
+                        shadow_fresh_auditor.capture_fresh_logits(fresh_logits)
                     if cfg_scale > 0.:
                         un_embeds = x_embeds.clone() # shape (1, l + gen_length + suffix_len, d)
                         un_mask = prompt_index.unsqueeze(-1).expand_as(x_embeds)  # shape (1, l + gen_length + suffix_len, d)
@@ -2707,6 +2765,11 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                             logits = elastic_cache_controller.restore_sequence(
                                 logits, fill_value=0.0
                             )
+                    if (
+                        shadow_fresh_auditor is not None
+                        and shadow_fresh_auditor.should_run(global_step)
+                    ):
+                        shadow_fresh_auditor.capture_primary_logits(logits)
 
                     if (
                         visual_rewrite_context is not None
@@ -2721,6 +2784,13 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     if elastic_cache_controller is not None:
                         elastic_cache_controller.observe_logits(logits)
                         elastic_cache_controller.end_step()
+                    if (
+                        shadow_fresh_auditor is not None
+                        and shadow_fresh_auditor.should_run(global_step)
+                    ):
+                        shadow_fresh_auditor.finish_step(
+                            compute_seconds=shadow_compute_seconds
+                        )
 
                     exact_entropy = None
                     if capture_exact_entropy:
