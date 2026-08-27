@@ -2310,6 +2310,13 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                 num_transfer_tokens = self.get_num_transfer_tokens(block_mask_index, steps)
                 for i in range(steps):
                     global_step = num_block * steps + i
+                    if elastic_cache_controller is not None and x_embeds.is_cuda:
+                        torch.cuda.synchronize(x_embeds.device)
+                    elastic_action_started = (
+                        time.perf_counter()
+                        if elastic_cache_controller is not None
+                        else None
+                    )
                     # Determine which positions are mask embeddings
                     mask_index = torch.all(torch.abs(x_embeds - masked_embed) < 1e-5, dim=2)
 
@@ -2343,6 +2350,53 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                             ),
                             as_tuple=False,
                         ).flatten()
+                        policy_counterfactual = None
+                        if elastic_cache_controller.needs_policy_probe(global_step):
+                            if cfg_scale > 0.0:
+                                raise ValueError(
+                                    "forced-action policy probe requires cfg_scale=0"
+                                )
+                            policy_controller = (
+                                elastic_cache_controller.fork_policy_probe()
+                            )
+                            policy_query_positions = policy_controller.begin_step(
+                                step=global_step,
+                                block=num_block,
+                                sequence_length=total_length,
+                                masked_positions=all_masked_positions,
+                                active_masked_positions=active_masked_positions,
+                                newly_decoded_positions=elastic_newly_decoded,
+                                multimodal_layout=(
+                                    copy.deepcopy(extended_layouts[0])
+                                    if extended_layouts
+                                    else None
+                                ),
+                            )
+                            policy_forward_embeds = x_embeds.index_select(
+                                1, policy_query_positions
+                            )
+                            rng_devices = (
+                                [x_embeds.device.index] if x_embeds.is_cuda else []
+                            )
+                            if x_embeds.is_cuda:
+                                torch.cuda.synchronize(x_embeds.device)
+                            policy_probe_started = time.perf_counter()
+                            with torch.random.fork_rng(devices=rng_devices):
+                                self.model(
+                                    inputs_embeds=policy_forward_embeds,
+                                    elastic_cache_controller=policy_controller,
+                                )
+                            if x_embeds.is_cuda:
+                                torch.cuda.synchronize(x_embeds.device)
+                            policy_probe_seconds = (
+                                time.perf_counter() - policy_probe_started
+                            )
+                            policy_controller.end_step()
+                            policy_counterfactual = (
+                                policy_controller.policy_counterfactual(
+                                    probe_compute_seconds=policy_probe_seconds
+                                )
+                            )
                         elastic_query_positions = elastic_cache_controller.begin_step(
                             step=global_step,
                             block=num_block,
@@ -2355,6 +2409,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                                 if extended_layouts
                                 else None
                             ),
+                            policy_counterfactual=policy_counterfactual,
                         )
                         if (
                             shadow_fresh_auditor is not None
@@ -2783,7 +2838,13 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         logits[:, :, token_id] = torch.where(mask_index, -float('inf'), logits[:, :, token_id])
                     if elastic_cache_controller is not None:
                         elastic_cache_controller.observe_logits(logits)
-                        elastic_cache_controller.end_step()
+                        if x_embeds.is_cuda:
+                            torch.cuda.synchronize(x_embeds.device)
+                        elastic_cache_controller.end_step(
+                            action_compute_seconds=(
+                                time.perf_counter() - elastic_action_started
+                            )
+                        )
                     if (
                         shadow_fresh_auditor is not None
                         and shadow_fresh_auditor.should_run(global_step)
