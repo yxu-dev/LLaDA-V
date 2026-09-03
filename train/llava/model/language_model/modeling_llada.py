@@ -21,6 +21,7 @@
 
 import copy
 import math
+import random
 import time
 import warnings
 from typing import List, Optional, Tuple, Union
@@ -82,6 +83,31 @@ def _profiler_option(options, name, default=False):
     if isinstance(options, dict):
         return options.get(name, default)
     return getattr(options, name, default)
+
+
+def _capture_branch_rng(device):
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state().clone(),
+        "torch_cuda": (
+            torch.cuda.get_rng_state(device).clone().cpu()
+            if device.type == "cuda"
+            else None
+        ),
+        "decoder_specific": None,
+    }
+
+
+def _restore_branch_rng(state, device):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"].cpu())
+    if device.type == "cuda":
+        cuda_state = state.get("torch_cuda")
+        if cuda_state is None:
+            raise ValueError("CUDA branch state has no CUDA RNG state")
+        torch.cuda.set_rng_state(cuda_state.cpu(), device=device)
 
 
 def _phase31_layer_actions(actions, layer_count):
@@ -2014,6 +2040,9 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         context_feedback_intervention_callback=None,
         elastic_cache_controller=None,
         shadow_fresh_auditor=None,
+        elastic_branch_snapshot_step=None,
+        elastic_branch_snapshot_callback=None,
+        elastic_branch_state=None,
         stop_after_step=None,
         **kwargs,
     ):
@@ -2179,6 +2208,24 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     raise ValueError("Elastic cache requires cfg_scale=0 and batch size 1")
                 if getattr(self.config, "_attn_implementation", None) != "eager":
                     raise ValueError("Elastic cache requires eager attention")
+            branch_requested = (
+                elastic_branch_snapshot_step is not None
+                or elastic_branch_snapshot_callback is not None
+                or elastic_branch_state is not None
+            )
+            if branch_requested and elastic_cache_controller is None:
+                raise ValueError("Elastic branch state requires the Elastic controller")
+            if (elastic_branch_snapshot_step is None) != (
+                elastic_branch_snapshot_callback is None
+            ):
+                raise ValueError(
+                    "Elastic branch capture requires both a step and callback"
+                )
+            if elastic_branch_snapshot_step is not None and (
+                not isinstance(elastic_branch_snapshot_step, int)
+                or not 0 <= elastic_branch_snapshot_step < steps
+            ):
+                raise ValueError("Elastic branch snapshot step is outside generation")
             extended_layouts = _extend_multimodal_layouts(
                 multimodal_layout,
                 inputs_embeds.shape[1],
@@ -2281,7 +2328,66 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                 0, dtype=torch.long, device=x_embeds.device
             )
             if elastic_cache_controller is not None:
-                elastic_cache_controller.reset()
+                if elastic_branch_state is None:
+                    elastic_cache_controller.reset()
+                else:
+                    if num_blocks != 1:
+                        raise ValueError(
+                            "Elastic branch replay currently requires one decoding block"
+                        )
+                    expected = {
+                        "steps_per_block": steps,
+                        "gen_length": gen_length,
+                        "block_length": block_length,
+                        "prompt_length": inputs_embeds.shape[1],
+                        "total_length": total_length,
+                    }
+                    if any(
+                        int(elastic_branch_state.get(name, -1)) != int(value)
+                        for name, value in expected.items()
+                    ):
+                        raise ValueError("Elastic branch state generation shape mismatch")
+                    x = elastic_branch_state["input_ids"].to(
+                        device=x_embeds.device, dtype=x.dtype
+                    ).clone()
+                    x_embeds = elastic_branch_state["input_embeds"].to(
+                        device=x_embeds.device, dtype=x_embeds.dtype
+                    ).clone()
+                    restored_mask = torch.all(
+                        torch.abs(x_embeds - masked_embed) < 1e-5, dim=2
+                    )
+                    if not torch.equal(
+                        restored_mask,
+                        elastic_branch_state["mask_state"].to(
+                            device=x_embeds.device, dtype=torch.bool
+                        ),
+                    ):
+                        raise ValueError("Elastic branch state mask mismatch")
+                    elastic_newly_decoded = elastic_branch_state[
+                        "newly_decoded_positions"
+                    ].to(device=x_embeds.device, dtype=torch.long).clone()
+                    elastic_cache_controller.restore_state(
+                        elastic_branch_state["controller_state"],
+                        device=x_embeds.device,
+                    )
+                    decoder_state = elastic_branch_state["decoder_state"]
+                    found_stop_seq = bool(decoder_state["found_stop_sequence"])
+                    stop_position = int(decoder_state["stop_position"])
+                    if int(elastic_branch_state.get("block_index", -1)) != 0:
+                        raise ValueError("Elastic branch state has an invalid block index")
+                    if int(elastic_branch_state.get("next_action_index", -1)) != int(
+                        elastic_branch_state["block_step"]
+                    ):
+                        raise ValueError("Elastic branch state action index mismatch")
+                    if int(
+                        elastic_branch_state["controller_state"][
+                            "completed_action_index"
+                        ]
+                    ) != int(elastic_branch_state["next_action_index"]) - 1:
+                        raise ValueError("Elastic controller state is not pre-action")
+                    _restore_branch_rng(
+                        elastic_branch_state["rng_state"], x_embeds.device
+                    )
             selected_visual_keys = None
             visual_mask_activation_step = None
             visual_mask_proposal_id = None
@@ -2290,6 +2396,11 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             visual_mask_fallback_action = None
             visual_mask_participation_proxy = 0.0
             requested_early_stop = False
+            resume_block_step = (
+                int(elastic_branch_state["block_step"])
+                if elastic_branch_state is not None
+                else 0
+            )
             for num_block in range(num_blocks):
                 # Create mask index for the current block
                 block_start = inputs_embeds.shape[1] + num_block * block_length
@@ -2307,8 +2418,14 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                 block_embeds = x_embeds[:, block_start:block_end]
                 block_mask_index = torch.all(torch.abs(block_embeds - masked_embed) < 1e-5, dim=2)
                 
-                num_transfer_tokens = self.get_num_transfer_tokens(block_mask_index, steps)
-                for i in range(steps):
+                num_transfer_tokens = (
+                    elastic_branch_state["num_transfer_tokens"].to(
+                        device=x_embeds.device
+                    )
+                    if elastic_branch_state is not None and num_block == 0
+                    else self.get_num_transfer_tokens(block_mask_index, steps)
+                )
+                for i in range(resume_block_step if num_block == 0 else 0, steps):
                     global_step = num_block * steps + i
                     if elastic_cache_controller is not None and x_embeds.is_cuda:
                         torch.cuda.synchronize(x_embeds.device)
@@ -2332,6 +2449,50 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     current_block_masks = mask_index[0, block_start:block_end]
                     if not current_block_masks.any():
                         break
+
+                    if (
+                        elastic_branch_snapshot_step == global_step
+                        and elastic_branch_snapshot_callback is not None
+                    ):
+                        snapshot_mask = mask_index.detach().clone().cpu()
+                        snapshot = {
+                            "schema_version": 1,
+                            "next_action_index": int(global_step),
+                            "block_index": int(num_block),
+                            "block_step": int(i),
+                            "steps_per_block": int(steps),
+                            "gen_length": int(gen_length),
+                            "block_length": int(block_length),
+                            "prompt_length": int(inputs_embeds.shape[1]),
+                            "total_length": int(total_length),
+                            "input_ids": x.detach().clone().cpu(),
+                            "input_embeds": x_embeds.detach().clone().cpu(),
+                            "mask_state": snapshot_mask,
+                            "newly_decoded_positions": (
+                                elastic_newly_decoded.detach().clone().cpu()
+                            ),
+                            "num_transfer_tokens": (
+                                num_transfer_tokens.detach().clone().cpu()
+                            ),
+                            "controller_state": (
+                                elastic_cache_controller.snapshot_state()
+                            ),
+                            "rng_state": _capture_branch_rng(x_embeds.device),
+                            "decoder_state": {
+                                "found_stop_sequence": bool(found_stop_seq),
+                                "stop_position": int(stop_position),
+                            },
+                        }
+                        if not torch.equal(
+                            snapshot_mask,
+                            torch.all(
+                                torch.abs(snapshot["input_embeds"] - masked_embed.cpu())
+                                < 1e-5,
+                                dim=2,
+                            ),
+                        ):
+                            raise RuntimeError("captured branch mask state is inconsistent")
+                        elastic_branch_snapshot_callback(snapshot)
 
                     elastic_query_positions = None
                     if elastic_cache_controller is not None:
