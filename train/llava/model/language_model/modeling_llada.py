@@ -2044,6 +2044,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         elastic_branch_snapshot_callback=None,
         elastic_branch_state=None,
         stop_after_step=None,
+        commit_policy=None,
+        commit_threshold=0.9,
         **kwargs,
     ):
         '''
@@ -2208,6 +2210,17 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     raise ValueError("Elastic cache requires cfg_scale=0 and batch size 1")
                 if getattr(self.config, "_attn_implementation", None) != "eager":
                     raise ValueError("Elastic cache requires eager attention")
+            if commit_policy is not None:
+                if commit_policy not in {"top2", "threshold"}:
+                    raise ValueError("commit_policy must be top2 or threshold")
+                if elastic_cache_controller is None or elastic_cache_controller.config.window_beta is not None:
+                    raise ValueError("parallel commit requires unwindowed Elastic cache")
+                if gen_length != block_length or inputs_embeds.shape[0] != 1 or cfg_scale != 0.0:
+                    raise ValueError("parallel commit requires one block, batch size 1, and cfg_scale=0")
+                if remasking != "low_confidence":
+                    raise ValueError("parallel commit requires native probability confidence")
+                if not 0.0 <= commit_threshold <= 1.0:
+                    raise ValueError("commit_threshold must be a probability")
             branch_requested = (
                 elastic_branch_snapshot_step is not None
                 or elastic_branch_snapshot_callback is not None
@@ -3102,7 +3115,31 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     
                     transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
                     for j in range(confidence.shape[0]):
-                        if eligible_positions is not None:
+                        if commit_policy is not None:
+                            legal_index = torch.nonzero(
+                                mask_index[j, block_start:block_end]
+                                & torch.isfinite(confidence[j, block_start:block_end]),
+                                as_tuple=False,
+                            ).flatten() + block_start
+                            if commit_policy == "top2":
+                                _, local_index = torch.topk(
+                                    confidence[j].index_select(0, legal_index),
+                                    k=min(2, int(legal_index.numel())),
+                                )
+                                select_index = legal_index.index_select(0, local_index)
+                            else:
+                                selected = legal_index[
+                                    confidence[j].index_select(0, legal_index) >= commit_threshold
+                                ]
+                                if selected.numel():
+                                    select_index = selected
+                                else:
+                                    _, local_index = torch.topk(
+                                        confidence[j].index_select(0, legal_index), k=1
+                                    )
+                                    select_index = legal_index.index_select(0, local_index)
+                            planned = int(select_index.numel())
+                        elif eligible_positions is not None:
                             eligible_index = torch.nonzero(eligible_positions[j], as_tuple=False).flatten()
                             planned = int(num_transfer_tokens[j, i].item())
                             if planned < 1 or planned > int(eligible_index.numel()):
@@ -3132,7 +3169,9 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                             )
                         transfer_index[j, select_index] = True
                         if elastic_cache_controller is not None and elastic_cache_controller.config.track_work_counts:
-                            elastic_cache_controller.planned_commits += int(num_transfer_tokens[j, i].item())
+                            elastic_cache_controller.planned_commits += (
+                                planned if commit_policy is not None else int(num_transfer_tokens[j, i].item())
+                            )
                             elastic_cache_controller.actual_commits += int(select_index.numel())
                     vanilla_transfer_index = transfer_index.detach().clone()
                     extra_transfer_index = torch.zeros_like(
