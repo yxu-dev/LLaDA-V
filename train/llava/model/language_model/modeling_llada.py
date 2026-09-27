@@ -2427,11 +2427,15 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                 )
                 for i in range(resume_block_step if num_block == 0 else 0, steps):
                     global_step = num_block * steps + i
-                    if elastic_cache_controller is not None and x_embeds.is_cuda:
+                    capture_elastic_timing = (
+                        elastic_cache_controller is not None
+                        and elastic_cache_controller.config.capture_research_records
+                    )
+                    if capture_elastic_timing and x_embeds.is_cuda:
                         torch.cuda.synchronize(x_embeds.device)
                     elastic_action_started = (
                         time.perf_counter()
-                        if elastic_cache_controller is not None
+                        if capture_elastic_timing
                         else None
                     )
                     # Determine which positions are mask embeddings
@@ -2999,11 +3003,12 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         logits[:, :, token_id] = torch.where(mask_index, -float('inf'), logits[:, :, token_id])
                     if elastic_cache_controller is not None:
                         elastic_cache_controller.observe_logits(logits)
-                        if x_embeds.is_cuda:
+                        if capture_elastic_timing and x_embeds.is_cuda:
                             torch.cuda.synchronize(x_embeds.device)
                         elastic_cache_controller.end_step(
                             action_compute_seconds=(
                                 time.perf_counter() - elastic_action_started
+                                if capture_elastic_timing else None
                             )
                         )
                     if (
