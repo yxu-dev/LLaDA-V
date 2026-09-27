@@ -2982,6 +2982,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         )
                         logits = self.lm_head(outputs[0]).float()
                         if elastic_cache_controller is not None:
+                            if elastic_cache_controller.config.track_work_counts:
+                                elastic_cache_controller.lm_head_projection_rows += int(outputs[0].shape[1])
                             logits = elastic_cache_controller.restore_sequence(
                                 logits, fill_value=0.0
                             )
@@ -3082,10 +3084,34 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     
                     # Calculate confidence and determine transfer index
                     confidence = torch.where(mask_index, x0_p, -np.inf)
+                    eligible_positions = None
+                    if (
+                        elastic_cache_controller is not None
+                        and elastic_cache_controller.window_positions is not None
+                    ):
+                        eligible_positions = torch.zeros_like(mask_index)
+                        eligible_positions[:, elastic_cache_controller.window_positions] = True
+                        eligible_positions &= mask_index
+                        eligible_positions[:, :block_start] = False
+                        eligible_positions[:, block_end:] = False
+                        if found_stop_seq:
+                            eligible_positions[:, stop_position:] = False
+                        confidence = torch.where(eligible_positions, confidence, -np.inf)
+                    if elastic_cache_controller is not None and elastic_cache_controller.config.track_work_counts:
+                        elastic_cache_controller.output_processing_rows += int(logits.shape[1])
                     
                     transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
                     for j in range(confidence.shape[0]):
-                        if transfer_policy_callback is None:
+                        if eligible_positions is not None:
+                            eligible_index = torch.nonzero(eligible_positions[j], as_tuple=False).flatten()
+                            planned = int(num_transfer_tokens[j, i].item())
+                            if planned < 1 or planned > int(eligible_index.numel()):
+                                raise RuntimeError("window cannot satisfy the native transfer quota")
+                            _, local_index = torch.topk(
+                                confidence[j].index_select(0, eligible_index), k=planned
+                            )
+                            select_index = eligible_index.index_select(0, local_index)
+                        elif transfer_policy_callback is None:
                             _, select_index = torch.topk(
                                 confidence[j],
                                 k=num_transfer_tokens[j, i],
@@ -3105,6 +3131,9 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                                 k=transfer_count,
                             )
                         transfer_index[j, select_index] = True
+                        if elastic_cache_controller is not None and elastic_cache_controller.config.track_work_counts:
+                            elastic_cache_controller.planned_commits += int(num_transfer_tokens[j, i].item())
+                            elastic_cache_controller.actual_commits += int(select_index.numel())
                     vanilla_transfer_index = transfer_index.detach().clone()
                     extra_transfer_index = torch.zeros_like(
                         transfer_index,
