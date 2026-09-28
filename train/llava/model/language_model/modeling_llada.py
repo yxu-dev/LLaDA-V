@@ -2043,6 +2043,9 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         elastic_branch_snapshot_step=None,
         elastic_branch_snapshot_callback=None,
         elastic_branch_state=None,
+        elastic_commit_probe_callback=None,
+        elastic_branch_commit_mode=None,
+        elastic_branch_resume_callback=None,
         stop_after_step=None,
         commit_policy=None,
         commit_threshold=0.9,
@@ -2221,6 +2224,16 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     raise ValueError("parallel commit requires native probability confidence")
                 if not 0.0 <= commit_threshold <= 1.0:
                     raise ValueError("commit_threshold must be a probability")
+            if elastic_commit_probe_callback is not None and (
+                commit_policy is None or not elastic_cache_controller.config.track_work_counts
+            ):
+                raise ValueError("commit probe requires counted parallel commits")
+            if elastic_branch_commit_mode is not None and elastic_branch_commit_mode not in {"A", "D"}:
+                raise ValueError("commit branch mode must be A or D")
+            if elastic_branch_commit_mode is not None and elastic_branch_state is None:
+                raise ValueError("commit branch mode requires a branch state")
+            if elastic_branch_commit_mode is not None and commit_policy is None:
+                raise ValueError("commit branch mode requires a parallel commit policy")
             branch_requested = (
                 elastic_branch_snapshot_step is not None
                 or elastic_branch_snapshot_callback is not None
@@ -2388,19 +2401,55 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     stop_position = int(decoder_state["stop_position"])
                     if int(elastic_branch_state.get("block_index", -1)) != 0:
                         raise ValueError("Elastic branch state has an invalid block index")
-                    if int(elastic_branch_state.get("next_action_index", -1)) != int(
-                        elastic_branch_state["block_step"]
-                    ):
-                        raise ValueError("Elastic branch state action index mismatch")
-                    if int(
-                        elastic_branch_state["controller_state"][
-                            "completed_action_index"
-                        ]
-                    ) != int(elastic_branch_state["next_action_index"]) - 1:
-                        raise ValueError("Elastic controller state is not pre-action")
+                    if elastic_branch_commit_mode is None:
+                        if int(elastic_branch_state.get("next_action_index", -1)) != int(
+                            elastic_branch_state["block_step"]
+                        ):
+                            raise ValueError("Elastic branch state action index mismatch")
+                        if int(
+                            elastic_branch_state["controller_state"][
+                                "completed_action_index"
+                            ]
+                        ) != int(elastic_branch_state["next_action_index"]) - 1:
+                            raise ValueError("Elastic controller state is not pre-action")
+                    else:
+                        if (int(elastic_branch_state.get("schema_version", -1)) != 2
+                                or elastic_branch_state.get("boundary") != "post_forward_pre_commit"
+                                or elastic_branch_state.get("commit_policy") != commit_policy
+                                or float(elastic_branch_state.get("commit_threshold", -1)) != float(commit_threshold)
+                                or int(elastic_branch_state["controller_state"]["completed_action_index"])
+                                != int(elastic_branch_state["block_step"])):
+                            raise ValueError("Elastic commit branch state differs")
                     _restore_branch_rng(
                         elastic_branch_state["rng_state"], x_embeds.device
                     )
+                    if elastic_branch_commit_mode is not None:
+                        planned = elastic_branch_state["planned_transfer_index"].to(
+                            device=x_embeds.device, dtype=torch.bool
+                        )
+                        selected = planned.clone()
+                        if elastic_branch_commit_mode == "D":
+                            selected.zero_()
+                            selected[0, int(elastic_branch_state["top1_position"])] = True
+                        if (int(planned.sum().item()) < 2
+                                or torch.any(planned & ~restored_mask)
+                                or torch.any(selected & ~planned)):
+                            raise ValueError("Elastic commit branch selection is invalid")
+                        prediction_ids = elastic_branch_state["prediction_ids"].to(
+                            device=x.device, dtype=x.dtype
+                        )
+                        prediction_embeds = elastic_branch_state["prediction_embeds"].to(
+                            device=x_embeds.device, dtype=x_embeds.dtype
+                        )
+                        if elastic_branch_resume_callback is not None:
+                            elastic_branch_resume_callback()
+                        x_embeds[selected] = prediction_embeds[selected]
+                        x[selected] = prediction_ids[selected]
+                        elastic_newly_decoded = torch.nonzero(
+                            selected[0], as_tuple=False
+                        ).flatten()
+                        elastic_cache_controller.planned_commits = int(planned.sum().item())
+                        elastic_cache_controller.actual_commits = int(selected.sum().item())
             selected_visual_keys = None
             visual_mask_activation_step = None
             visual_mask_proposal_id = None
@@ -2411,6 +2460,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             requested_early_stop = False
             resume_block_step = (
                 int(elastic_branch_state["block_step"])
+                + int(elastic_branch_commit_mode is not None)
                 if elastic_branch_state is not None
                 else 0
             )
@@ -3173,6 +3223,57 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                                 planned if commit_policy is not None else int(num_transfer_tokens[j, i].item())
                             )
                             elastic_cache_controller.actual_commits += int(select_index.numel())
+                    if elastic_commit_probe_callback is not None:
+                        planned_positions = torch.nonzero(
+                            transfer_index[0], as_tuple=False
+                        ).flatten()
+                        planned_count = int(planned_positions.numel())
+
+                        def capture_commit_state():
+                            planned_confidence = confidence[0].index_select(
+                                0, planned_positions
+                            )
+                            top1_position = int(planned_positions[
+                                torch.argmax(planned_confidence)
+                            ].item())
+                            return {
+                                "schema_version": 2,
+                                "boundary": "post_forward_pre_commit",
+                                "block_index": int(num_block),
+                                "block_step": int(i),
+                                "steps_per_block": int(steps),
+                                "gen_length": int(gen_length),
+                                "block_length": int(block_length),
+                                "prompt_length": int(inputs_embeds.shape[1]),
+                                "total_length": int(total_length),
+                                "input_ids": x.detach().clone().cpu(),
+                                "input_embeds": x_embeds.detach().clone().cpu(),
+                                "mask_state": mask_index.detach().clone().cpu(),
+                                "newly_decoded_positions": elastic_newly_decoded.detach().clone().cpu(),
+                                "num_transfer_tokens": num_transfer_tokens.detach().clone().cpu(),
+                                "controller_state": elastic_cache_controller.snapshot_state(),
+                                "rng_state": _capture_branch_rng(x_embeds.device),
+                                "decoder_state": {
+                                    "found_stop_sequence": bool(found_stop_seq),
+                                    "stop_position": int(stop_position),
+                                },
+                                "prediction_ids": x0.detach().clone().cpu(),
+                                "prediction_embeds": x0_embeds.detach().clone().cpu(),
+                                "planned_transfer_index": transfer_index.detach().clone().cpu(),
+                                "planned_confidences": planned_confidence.detach().clone().cpu(),
+                                "top1_position": top1_position,
+                                "committed_before": int(elastic_cache_controller.actual_commits) - planned_count,
+                                "planned_count": planned_count,
+                                "commit_policy": commit_policy,
+                                "commit_threshold": float(commit_threshold),
+                            }
+
+                        elastic_commit_probe_callback(
+                            action_index=int(global_step),
+                            committed_before=int(elastic_cache_controller.actual_commits) - planned_count,
+                            planned_count=planned_count,
+                            capture_state=capture_commit_state,
+                        )
                     vanilla_transfer_index = transfer_index.detach().clone()
                     extra_transfer_index = torch.zeros_like(
                         transfer_index,
