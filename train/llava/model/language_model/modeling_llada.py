@@ -2048,6 +2048,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         elastic_branch_resume_callback=None,
         stop_after_step=None,
         commit_policy=None,
+        commit_pair_selector_callback=None,
         commit_threshold=0.9,
         **kwargs,
     ):
@@ -2224,6 +2225,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                     raise ValueError("parallel commit requires native probability confidence")
                 if not 0.0 <= commit_threshold <= 1.0:
                     raise ValueError("commit_threshold must be a probability")
+            if commit_pair_selector_callback is not None and commit_policy != "top2":
+                raise ValueError("commit pair selector requires the P2 commit policy")
             if elastic_commit_probe_callback is not None and (
                 commit_policy is None or not elastic_cache_controller.config.track_work_counts
             ):
@@ -3223,6 +3226,29 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                                 planned if commit_policy is not None else int(num_transfer_tokens[j, i].item())
                             )
                             elastic_cache_controller.actual_commits += int(select_index.numel())
+                    if commit_pair_selector_callback is not None:
+                        selected_positions = commit_pair_selector_callback(
+                            action_index=int(global_step),
+                            mask_state=mask_index[0],
+                            confidence=confidence[0],
+                            predictions=x0[0],
+                            original_transfer_index=transfer_index[0],
+                            response_span=(block_start, block_end),
+                        )
+                        selected_positions = torch.as_tensor(
+                            selected_positions, device=x0.device, dtype=torch.long
+                        )
+                        original_count = int(transfer_index[0].sum().item())
+                        if (selected_positions.ndim != 1
+                                or selected_positions.numel() != original_count
+                                or selected_positions.unique().numel() != original_count
+                                or torch.any(selected_positions < block_start)
+                                or torch.any(selected_positions >= block_end)
+                                or not torch.all(mask_index[0, selected_positions])
+                                or not torch.all(torch.isfinite(confidence[0, selected_positions]))):
+                            raise ValueError("commit pair selector returned an illegal pair")
+                        transfer_index.zero_()
+                        transfer_index[0, selected_positions] = True
                     if elastic_commit_probe_callback is not None:
                         planned_positions = torch.nonzero(
                             transfer_index[0], as_tuple=False
