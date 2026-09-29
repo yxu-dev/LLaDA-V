@@ -2045,6 +2045,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
         elastic_branch_state=None,
         elastic_commit_probe_callback=None,
         elastic_branch_commit_mode=None,
+        elastic_branch_commit_positions=None,
         elastic_branch_resume_callback=None,
         stop_after_step=None,
         commit_policy=None,
@@ -2215,8 +2216,8 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                 if getattr(self.config, "_attn_implementation", None) != "eager":
                     raise ValueError("Elastic cache requires eager attention")
             if commit_policy is not None:
-                if commit_policy not in {"top2", "threshold"}:
-                    raise ValueError("commit_policy must be top2 or threshold")
+                if commit_policy not in {"top2", "top4", "threshold"}:
+                    raise ValueError("commit_policy must be top2, top4, or threshold")
                 if elastic_cache_controller is None or elastic_cache_controller.config.window_beta is not None:
                     raise ValueError("parallel commit requires unwindowed Elastic cache")
                 if gen_length != block_length or inputs_embeds.shape[0] != 1 or cfg_scale != 0.0:
@@ -2231,8 +2232,10 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                 commit_policy is None or not elastic_cache_controller.config.track_work_counts
             ):
                 raise ValueError("commit probe requires counted parallel commits")
-            if elastic_branch_commit_mode is not None and elastic_branch_commit_mode not in {"A", "D"}:
-                raise ValueError("commit branch mode must be A or D")
+            if elastic_branch_commit_mode is not None and elastic_branch_commit_mode not in {"A", "D", "custom"}:
+                raise ValueError("commit branch mode must be A, D, or custom")
+            if (elastic_branch_commit_positions is not None) != (elastic_branch_commit_mode == "custom"):
+                raise ValueError("custom commit branch requires explicit positions")
             if elastic_branch_commit_mode is not None and elastic_branch_state is None:
                 raise ValueError("commit branch mode requires a branch state")
             if elastic_branch_commit_mode is not None and commit_policy is None:
@@ -2434,6 +2437,18 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                         if elastic_branch_commit_mode == "D":
                             selected.zero_()
                             selected[0, int(elastic_branch_state["top1_position"])] = True
+                        elif elastic_branch_commit_mode == "custom":
+                            positions = torch.as_tensor(
+                                elastic_branch_commit_positions, device=x_embeds.device,
+                                dtype=torch.long,
+                            )
+                            if (positions.ndim != 1 or positions.numel() < 1
+                                    or positions.unique().numel() != positions.numel()
+                                    or torch.any(positions < 0)
+                                    or torch.any(positions >= planned.shape[1])):
+                                raise ValueError("custom commit positions are invalid")
+                            selected.zero_()
+                            selected[0, positions] = True
                         if (int(planned.sum().item()) < 2
                                 or torch.any(planned & ~restored_mask)
                                 or torch.any(selected & ~planned)):
@@ -3174,10 +3189,11 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                                 & torch.isfinite(confidence[j, block_start:block_end]),
                                 as_tuple=False,
                             ).flatten() + block_start
-                            if commit_policy == "top2":
+                            if commit_policy in {"top2", "top4"}:
                                 _, local_index = torch.topk(
                                     confidence[j].index_select(0, legal_index),
-                                    k=min(2, int(legal_index.numel())),
+                                    k=min(2 if commit_policy == "top2" else 4,
+                                          int(legal_index.numel())),
                                 )
                                 select_index = legal_index.index_select(0, local_index)
                             else:
@@ -3286,6 +3302,7 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
                                 "prediction_ids": x0.detach().clone().cpu(),
                                 "prediction_embeds": x0_embeds.detach().clone().cpu(),
                                 "planned_transfer_index": transfer_index.detach().clone().cpu(),
+                                "ranked_commit_positions": select_index.detach().clone().cpu(),
                                 "planned_confidences": planned_confidence.detach().clone().cpu(),
                                 "top1_position": top1_position,
                                 "committed_before": int(elastic_cache_controller.actual_commits) - planned_count,
