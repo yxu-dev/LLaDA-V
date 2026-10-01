@@ -2065,8 +2065,13 @@ class LLaDAModelLM(LLaDAPreTrainedModel):
             mask_id: The toke id of [MASK] is 126336.
             generation_suffix: (str or None) Generation suffix, such as "The answer is xxx", will be appended to the end
         '''
-        # Use mixed precision for faster computation
-        with torch.cuda.amp.autocast(enabled=True):
+        # Match the loaded canvas precision. Default CUDA autocast is FP16,
+        # which silently made BF16 rollouts differ from BF16 training states.
+        with torch.autocast(
+            device_type=inputs_embeds.device.type,
+            dtype=inputs_embeds.dtype,
+            enabled=inputs_embeds.is_cuda and inputs_embeds.dtype in (torch.float16, torch.bfloat16),
+        ):
             # Handle generation suffix
             suffix_embeds = None
             suffix_token_ids = None
